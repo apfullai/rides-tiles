@@ -1,0 +1,42 @@
+name: Bounded Illinois polygon occupancy preflight
+on:
+  workflow_dispatch:
+  push:
+    branches: [test/illinois-coverage-preflight]
+    paths:
+      - 'preflight/illinois_measure.py'
+      - 'preflight/illinois_test.py'
+      - '.github/workflows/illinois-preflight.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ride-tiles-readonly-preflight
+  cancel-in-progress: false
+jobs:
+  preflight:
+    if: github.repository == 'apfullai/rides-tiles' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install official distribution geometry tools
+        timeout-minutes: 3
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y osmium-tool
+          python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Test exact generator predicate and coverage-gap guards
+        run: |
+          PYTHONPATH=preflight python -m unittest discover -s preflight -p 'test_*.py' -v
+          PYTHONPATH=preflight python -m unittest discover -s preflight -p 'illinois_test.py' -v
+      - name: Measure only Illinois with input and memory caps
+        timeout-minutes: 11
+        run: python preflight/illinois_measure.py
+      - name: Confirm tracked sources are unchanged
+        if: always()
+        run: git diff --exit-code
