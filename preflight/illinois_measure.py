@@ -103,7 +103,7 @@ def main():
     try:
         limits()
         with tempfile.TemporaryDirectory(prefix='ride-illinois-') as directory:
-            work=Path(directory);src=work/'illinois.osm.pbf';polygon=work/'illinois.json';filtered=work/'cycling.osm.pbf'
+            work=Path(directory);src=work/'illinois.osm.pbf';polygon=work/'illinois.json'
             run(['curl','--fail','--location','--max-time','145','--max-filesize',str(MAX_SOURCE_BYTES),SOURCE_URL,'-o',str(src)],150)
             run(['curl','--fail','--max-time','30','--max-filesize',str(MAX_POLYGON_BYTES),POLYGON_URL,'-o',str(polygon)],35)
             if not 1_000_000<src.stat().st_size<=MAX_SOURCE_BYTES or not 0<polygon.stat().st_size<=MAX_POLYGON_BYTES:
@@ -114,9 +114,13 @@ def main():
             if not timestamp or dt.datetime.fromisoformat(timestamp.replace('Z','+00:00')).tzinfo is None:
                 raise ValueError('Missing source timestamp')
             result['osmReplicationTimestamp']=timestamp
-            run(['osmium','tags-filter',str(src),'w/highway=cycleway,path,footway,track,pedestrian','w/cycleway','w/cycleway:left','w/cycleway:right','w/cycleway:both','w/bicycle=designated,yes,official,permissive','-o',str(filtered)],150)
-            result['filteredBytes']=filtered.stat().st_size
-            proc=subprocess.Popen(['osmium','export','--attributes=id,type','-f','geojsonseq','-x','print_record_separator=false',str(filtered)],stdout=subprocess.PIPE,preexec_fn=limits)
+            # tags-filter reference ID tables exceeded the 2 GiB virtual-address
+            # limit. Export ways directly with a sparse disk-backed node index;
+            # the unchanged classifier is the authoritative feature filter.
+            index=work/'node-locations.idx'
+            result['pipeline']='direct-linestring-export+sparse_file_array+generator-classify'
+            result['memoryLimitKind']='RLIMIT_AS: virtual address space, not resident RAM'
+            proc=subprocess.Popen(['osmium','export','--geometry-types=linestring','--index-type',f'sparse_file_array,{index}','--attributes=id,type','-f','geojsonseq','-x','print_record_separator=false',str(src)],stdout=subprocess.PIPE,preexec_fn=limits)
             try:
                 # Binary readline limits avoid materializing an oversized feature.
                 lines=iter(lambda:proc.stdout.readline(MAX_LINE_BYTES+1),b'')
@@ -130,6 +134,8 @@ def main():
                 if proc.poll() is None:proc.terminate()
                 try:proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:proc.kill();proc.wait()
+                result['exportExitCode']=proc.returncode
+                result['temporaryIndexBytes']=index.stat().st_size if index.exists() else 0
     except Exception as exc:
         result.update(complete=False,stopReason='pipeline-error:'+type(exc).__name__,error=str(exc)[:500])
     finally:

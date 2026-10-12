@@ -1,7 +1,7 @@
-import json, sys, unittest
+import json, os, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from shapely.geometry import Polygon, MultiPolygon, box
-from illinois_measure import measure_lines
+from illinois_measure import measure_lines, limits
 import tile_generator as generator
 
 
@@ -36,6 +36,41 @@ class IllinoisTests(unittest.TestCase):
     def test_invalid_input_never_success(self):
         r=measure_lines([b'{invalid'],box(-88,41,-87.9,41.1))
         self.assertFalse(r['complete'])
+
+    def test_osmium_direct_export_matches_reference_filter(self):
+        osmium=os.environ.get('OSMIUM_BIN') or shutil.which('osmium')
+        if not osmium:self.skipTest('osmium executable required for CLI parity fixture')
+        tags=[{'highway':'cycleway'}, {'highway':'path','bicycle':'designated'},
+              {'highway':'residential','cycleway:left':'track'},
+              {'highway':'residential','cycleway:right':'lane'},
+              {'highway':'residential','cycleway:both':'shared_lane'},
+              {'highway':'footway','bicycle':'yes'}, {'highway':'track'},
+              {'highway':'path','bicycle':'designated','access':'private'},
+              {'highway':'footway'}, {'highway':'residential'}]
+        def xml(base):
+            ways=[]
+            for i,t in enumerate(tags,1):
+                attrs=''.join(f'<tag k="{k}" v="{v}"/>' for k,v in t.items())
+                ways.append(f'<way id="{i}"><nd ref="{base}"/><nd ref="{base+1}"/>{attrs}</way>')
+            return f'<osm version="0.6"><node id="{base}" lat="41.01" lon="-87.99"/><node id="{base+1}" lat="41.09" lon="-87.91"/>'+''.join(ways)+'</osm>'
+        def call(args):
+            return subprocess.check_output([osmium,*args],preexec_fn=limits,timeout=20)
+        def selected(raw):
+            items=[]
+            for line in raw.splitlines():
+                f=json.loads(line.lstrip(b'\x1e'));t=f.get('properties',{})
+                if f['geometry']['type'] in ('LineString','MultiLineString') and generator.classify(t):
+                    items.append((t.get('@id'),generator.classify(t),f['geometry']))
+            return items
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td);src=p/'small.osm';filtered=p/'filtered.osm.pbf';src.write_text(xml(1))
+            call(['tags-filter',str(src),'w/highway=cycleway,path,footway,track,pedestrian','w/cycleway','w/cycleway:left','w/cycleway:right','w/cycleway:both','w/bicycle=designated,yes,official,permissive','-o',str(filtered)])
+            reference=selected(call(['export','--attributes=id,type','-f','geojsonseq','-x','print_record_separator=false',str(filtered)]))
+            self.assertEqual(len(reference),7)
+            for base in (1,20_000_000_000):
+                original=p/f'source-{base}.osm';original.write_text(xml(base))
+                direct=selected(call(['export','--geometry-types=linestring','--index-type',f'sparse_file_array,{p / str(base)}','--attributes=id,type','-f','geojsonseq','-x','print_record_separator=false',str(original)]))
+                self.assertEqual(direct,reference)
 
 
 if __name__=='__main__':unittest.main()
