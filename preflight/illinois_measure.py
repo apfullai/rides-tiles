@@ -32,11 +32,11 @@ def run(args,seconds):
     subprocess.run(args,check=True,timeout=seconds,preexec_fn=limits)
 
 
-def read_polygon(path):
+def read_polygon(path,expected_fips='17',expected_name='Illinois'):
     j=json.loads(Path(path).read_text());features=j.get('features',[])
     if j.get('type')!='FeatureCollection' or len(features)!=1:raise ValueError('Expected one Census state')
     f=features[0]
-    if f.get('properties',{}).get('STATE')!='17' or f.get('properties',{}).get('NAME')!='Illinois':
+    if f.get('properties',{}).get('STATE')!=expected_fips or f.get('properties',{}).get('NAME')!=expected_name:
         raise ValueError('Wrong Census state')
     region=shape(f['geometry'])
     if region.geom_type not in ('Polygon','MultiPolygon') or not region.is_valid or region.is_empty:
@@ -95,21 +95,23 @@ def emit(result):
     text=json.dumps(result,indent=2)+'\n';print(text,flush=True)
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
-            f.write('## Bounded Illinois occupancy measurement\n\nNo hosted assets changed. Partial results are lower bounds only.\n\n```json\n'+text+'```\n')
+            f.write('## Bounded state occupancy measurement\n\nNo hosted assets changed. Partial results are lower bounds only.\n\n```json\n'+text+'```\n')
 
 
-def main():
-    result={'complete':False,'sourceUrl':SOURCE_URL,'coveragePolygonUrl':POLYGON_URL,'coverageSource':'US Census TIGERweb States, January 1 2026 vintage, STATE=17, no geometry simplification requested','startedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'limits':{'totalInputBytes':500_000_000,'memoryBytesPerProcess':MEMORY_BYTES,'measurementSeconds':240,'jobMinutes':15}}
+def main(config=None):
+    config=config or {'id':'illinois','name':'Illinois','fips':'17','sourceUrl':SOURCE_URL,'polygonUrl':POLYGON_URL}
+    source_url=config['sourceUrl'];polygon_url=config['polygonUrl']
+    result={'complete':False,'stateId':config['id'],'stateName':config['name'],'stateFips':config['fips'],'sourceUrl':source_url,'coveragePolygonUrl':polygon_url,'coverageSource':f"US Census TIGERweb States, January 1 2026 vintage, STATE={config['fips']}, no geometry simplification requested",'startedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'generatorCommit':os.environ.get('GITHUB_SHA','local'),'limits':{'totalInputBytes':500_000_000,'memoryBytesPerProcess':MEMORY_BYTES,'measurementSeconds':240,'jobMinutes':15}}
     try:
         limits()
-        with tempfile.TemporaryDirectory(prefix='ride-illinois-') as directory:
-            work=Path(directory);src=work/'illinois.osm.pbf';polygon=work/'illinois.json'
-            run(['curl','--fail','--location','--max-time','145','--max-filesize',str(MAX_SOURCE_BYTES),SOURCE_URL,'-o',str(src)],150)
-            run(['curl','--fail','--max-time','30','--max-filesize',str(MAX_POLYGON_BYTES),POLYGON_URL,'-o',str(polygon)],35)
+        with tempfile.TemporaryDirectory(prefix='ride-state-preflight-') as directory:
+            work=Path(directory);src=work/'state.osm.pbf';polygon=work/'state.json'
+            run(['curl','--fail','--location','--max-time','145','--max-filesize',str(MAX_SOURCE_BYTES),source_url,'-o',str(src)],150)
+            run(['curl','--fail','--max-time','30','--max-filesize',str(MAX_POLYGON_BYTES),polygon_url,'-o',str(polygon)],35)
             if not 1_000_000<src.stat().st_size<=MAX_SOURCE_BYTES or not 0<polygon.stat().st_size<=MAX_POLYGON_BYTES:
                 raise ValueError('Downloaded input exceeds size bounds')
             result.update({'sourceBytes':src.stat().st_size,'sourceSha256':digest(src),'coveragePolygonBytes':polygon.stat().st_size,'coveragePolygonSha256':digest(polygon)})
-            region=read_polygon(polygon)
+            region=read_polygon(polygon,config['fips'],config['name'])
             timestamp=subprocess.check_output(['osmium','fileinfo','-g','header.option.osmosis_replication_timestamp',str(src)],text=True,timeout=20).strip()
             if not timestamp or dt.datetime.fromisoformat(timestamp.replace('Z','+00:00')).tzinfo is None:
                 raise ValueError('Missing source timestamp')
