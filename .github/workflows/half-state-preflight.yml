@@ -1,0 +1,56 @@
+name: Bounded nearest-half neighbor preflight
+on:
+  workflow_dispatch:
+    inputs:
+      state:
+        description: Approved state, only after preceding state passed
+        required: true
+        type: choice
+        options: [iowa, missouri, kentucky]
+  push:
+    branches: [test/half-occupancy-iowa, test/half-occupancy-missouri, test/half-occupancy-kentucky]
+    paths:
+      - 'preflight/half_state_measure.py'
+      - 'preflight/half_state_test.py'
+      - 'preflight/illinois_measure.py'
+      - '.github/workflows/half-state-preflight.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ride-tiles-readonly-preflight
+  cancel-in-progress: false
+jobs:
+  preflight:
+    if: github.repository == 'apfullai/rides-tiles' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install official distribution geometry tools
+        timeout-minutes: 3
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y osmium-tool
+          python -m pip install --disable-pip-version-check -r requirements.txt pyproj==3.7.2
+      - name: Verify approved mappings and exact pipeline
+        run: |
+          PYTHONPATH=preflight python -m unittest discover -s preflight -p 'half_state_test.py' -v
+          PYTHONPATH=preflight python -m unittest discover -s preflight -p 'illinois_test.py' -v
+      - name: Measure one state only, no uploads or deployment
+        timeout-minutes: 11
+        env:
+          REQUESTED_STATE: ${{ inputs.state }}
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          state="$REQUESTED_STATE"
+          if [ -z "$state" ]; then state="${BRANCH_NAME#test/half-occupancy-}"; fi
+          case "$state" in iowa|missouri|kentucky) ;; *) echo 'Unapproved state'; exit 2 ;; esac
+          python preflight/half_state_measure.py --state "$state"
+      - name: Confirm tracked sources unchanged
+        if: always()
+        run: git diff --exit-code

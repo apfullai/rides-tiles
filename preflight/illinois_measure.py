@@ -117,6 +117,8 @@ def main(config=None):
                 raise ValueError('Downloaded input exceeds size bounds')
             result.update({'sourceBytes':src.stat().st_size,'sourceSha256':digest(src),'coveragePolygonBytes':polygon.stat().st_size,'coveragePolygonSha256':digest(polygon)})
             region=read_polygon(polygon,config['fips'],config['name'])
+            if config.get('prepareRegion'):
+                region=config['prepareRegion'](work,region,result)
             timestamp=subprocess.check_output(['osmium','fileinfo','-g','header.option.osmosis_replication_timestamp',str(src)],text=True,timeout=20).strip()
             if not timestamp or dt.datetime.fromisoformat(timestamp.replace('Z','+00:00')).tzinfo is None:
                 raise ValueError('Missing source timestamp')
