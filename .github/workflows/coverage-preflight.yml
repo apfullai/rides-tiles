@@ -1,0 +1,32 @@
+name: Read-only coverage budget preflight
+on:
+  workflow_dispatch:
+  push:
+    branches: [test/coverage-budget-preflight]
+    paths:
+      - 'preflight/**'
+      - '.github/workflows/coverage-preflight.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ride-tiles-readonly-preflight
+  cancel-in-progress: false
+jobs:
+  preflight:
+    if: github.repository == 'apfullai/rides-tiles' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test binary, coverage-gap, and dry-run budget guards
+        run: PYTHONPATH=preflight python -m unittest discover -s preflight -p 'test_*.py' -v
+      - name: Verify bootstrap and measure existing tiles only
+        timeout-minutes: 5
+        run: python preflight/run_preflight.py
+      - name: Confirm tracked sources are unchanged
+        run: git diff --exit-code
