@@ -1,0 +1,45 @@
+name: Bounded Illinois numerical format benchmark
+on:
+  workflow_dispatch:
+  push:
+    branches: [test/illinois-format-benchmark]
+    paths:
+      - 'preflight/illinois_format.py'
+      - 'preflight/variant_codec.py'
+      - 'preflight/variant_codec_test.py'
+      - 'preflight/format_test.py'
+      - '.github/workflows/illinois-format.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ride-tiles-readonly-preflight
+  cancel-in-progress: false
+jobs:
+  benchmark:
+    if: github.repository == 'apfullai/rides-tiles' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install official distribution codec tools
+        timeout-minutes: 3
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y osmium-tool
+          python -m pip install --disable-pip-version-check -r requirements-dev.txt
+      - name: Verify independent geometry decoding and bounded format logic
+        run: |
+          PYTHONPATH=preflight python -m unittest discover -s preflight -p 'variant_codec_test.py' -v
+          PYTHONPATH=preflight python -m unittest discover -s preflight -p 'format_test.py' -v
+          PYTHONPATH=preflight python -m unittest discover -s preflight -p 'illinois_test.py' -v
+      - name: Measure numeric formats sequentially without publishing
+        timeout-minutes: 11
+        run: python preflight/illinois_format.py
+      - name: Confirm tracked sources unchanged
+        if: always()
+        run: git diff --exit-code
