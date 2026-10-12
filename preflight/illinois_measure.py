@@ -44,9 +44,9 @@ def read_polygon(path,expected_fips='17',expected_name='Illinois'):
     return region
 
 
-def measure_lines(lines,region,seconds=240,max_features=MAX_FEATURES,max_tests=MAX_TILE_TESTS):
+def measure_lines(lines,region,seconds=240,max_features=MAX_FEATURES,max_tests=MAX_TILE_TESTS,skip_occupied=True):
     start=time.monotonic();prepared=prep(region);seen=set();tiles=set();counts=collections.Counter()
-    tested=0;read=0;stop=None
+    tested=0;encoded=0;skipped=0;read=0;stop=None
     try:
         for line in lines:
             read+=1
@@ -74,6 +74,11 @@ def measure_lines(lines,region,seconds=240,max_features=MAX_FEATURES,max_tests=M
                     if tested>=max_tests:stop='tile-test-budget';break
                     if time.monotonic()-start>seconds:stop='measurement-time-budget';break
                     tested+=1
+                    # Occupancy is an OR: a proven nonempty tile stays nonempty.
+                    # Count every candidate above, preserving the original guard.
+                    if skip_occupied and (z,x,y) in tiles:
+                        skipped+=1;continue
+                    encoded+=1
                     if generator.encode_tile([(1,kind,g,tags)],x,y,z):tiles.add((z,x,y))
                 if stop:break
             if stop:break
@@ -88,7 +93,7 @@ def measure_lines(lines,region,seconds=240,max_features=MAX_FEATURES,max_tests=M
     native={str(m):sum(n for z,n in perzoom.items() if z<=m) for m in (12,13,14)}
     low=sum(n for z,n in perzoom.items() if z<12)
     packed={str(span):low+len({(z,x//span,y//span) for z,x,y in tiles if z>=12}) for span in (4,8)}
-    return {'complete':stop is None,'stopReason':stop,'linesRead':read,'classifiedFeatures':dict(counts),'tilePredicateTests':tested,'nonemptyTileCountsByZoom':dict(sorted(perzoom.items())),'rawFilesThroughMaxZoom':native,'hybridRawZ8to11BundleZ12to14FileCounts':packed,'measurementSeconds':round(time.monotonic()-start,3),'peakProcessRssKiB':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,'interpretation':'Counts use the generator encoding predicate after exact Census polygon clipping. If incomplete, counts are lower bounds only. Bundle counts exclude indexes, oversized-group raw escapes, provenance and license-source files. No output-byte, fidelity, full-generation-runtime, or all-state-capacity claim.'}
+    return {'complete':stop is None,'stopReason':stop,'linesRead':read,'classifiedFeatures':dict(counts),'tileKeySha256':hashlib.sha256(''.join(f'{z}/{x}/{y}\n' for z,x,y in sorted(tiles)).encode()).hexdigest(),'tilePredicateTests':tested,'actualEncoderCalls':encoded,'provenOccupiedSkips':skipped,'nonemptyTileCountsByZoom':dict(sorted(perzoom.items())),'rawFilesThroughMaxZoom':native,'hybridRawZ8to11BundleZ12to14FileCounts':packed,'measurementSeconds':round(time.monotonic()-start,3),'peakProcessRssKiB':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,'interpretation':'Counts use the generator encoding predicate after exact Census polygon clipping. If incomplete, counts are lower bounds only. Bundle counts exclude indexes, oversized-group raw escapes, provenance and license-source files. No output-byte, fidelity, full-generation-runtime, or all-state-capacity claim.'}
 
 
 def emit(result):

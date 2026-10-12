@@ -37,6 +37,29 @@ class IllinoisTests(unittest.TestCase):
         r=measure_lines([b'{invalid'],box(-88,41,-87.9,41.1))
         self.assertFalse(r['complete'])
 
+    def test_occupied_skip_exact_parity_and_unchanged_candidate_cap(self):
+        # Repeated occupied cells, clipping, holes, tiny/empty encodings, and
+        # different categories must retain exactly the baseline occupancy.
+        region=box(-88,41,-87.6,41.4).difference(box(-87.85,41.1,-87.75,41.2))
+        fs=[feature(i,[[-87.99,41.01],[-87.61,41.39]],
+             {'highway':'cycleway'} if i%2 else {'highway':'residential','cycleway:left':'lane'}) for i in range(1,21)]
+        fs += [feature(21,[[-87.9,41.05],[-87.89999999,41.05000001]]),
+               feature(22,[[-88.1,41.15],[-87.5,41.15]])]
+        lines=[json.dumps(f).encode() for f in fs]
+        baseline=measure_lines(lines,region,skip_occupied=False)
+        fast=measure_lines(lines,region)
+        for key in ('complete','classifiedFeatures','tileKeySha256','tilePredicateTests','nonemptyTileCountsByZoom',
+                    'rawFilesThroughMaxZoom','hybridRawZ8to11BundleZ12to14FileCounts'):
+            self.assertEqual(fast[key],baseline[key],key)
+        self.assertGreater(fast['provenOccupiedSkips'],0)
+        self.assertLess(fast['actualEncoderCalls'],baseline['actualEncoderCalls'])
+        self.assertEqual(fast['actualEncoderCalls']+fast['provenOccupiedSkips'],fast['tilePredicateTests'])
+        for skip in (False,True):
+            capped=measure_lines(lines,region,max_tests=100,skip_occupied=skip)
+            self.assertFalse(capped['complete'])
+            self.assertEqual(capped['stopReason'],'tile-test-budget')
+            self.assertEqual(capped['tilePredicateTests'],100)
+
     def test_osmium_direct_export_matches_reference_filter(self):
         osmium=os.environ.get('OSMIUM_BIN') or shutil.which('osmium')
         if not osmium:self.skipTest('osmium executable required for CLI parity fixture')
