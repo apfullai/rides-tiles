@@ -1,4 +1,4 @@
-# Sequential measurement: Missouri after complete Iowa pass.
+# Sequential measurement: Kentucky after complete Missouri pass.
 name: Bounded nearest-half neighbor preflight
 on:
   workflow_dispatch:
