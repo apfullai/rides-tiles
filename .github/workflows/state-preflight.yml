@@ -1,3 +1,4 @@
+# Sequential measurement: Michigan, after verified Wisconsin pass.
 name: Bounded sequential state occupancy preflight
 on:
   workflow_dispatch:
