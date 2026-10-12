@@ -10,7 +10,6 @@ on:
       - 'requirements.txt'
       - 'requirements-dev.txt'
       - 'tests/**'
-      - '.github/workflows/pilot-pages.yml'
 permissions:
   contents: read
 concurrency:
@@ -35,6 +34,8 @@ jobs:
       - name: Generate the bounded public pilot
         timeout-minutes: 18
         run: python tools/build_region.py
+      - name: Preserve exact Chicago metro mirror in all full rebuilds
+        run: python publishing/append_metro.py site
       - name: Preserve reviewable pilot artifacts
         uses: actions/upload-artifact@v4
         with:
