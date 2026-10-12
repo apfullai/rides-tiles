@@ -1,0 +1,50 @@
+name: Append exact Chicago metro mirror without regeneration
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['publishing/append_metro.py', '.github/workflows/append-metro.yml']
+permissions:
+  contents: read
+concurrency:
+  group: ride-tiles-pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Restore verified complete public pilot snapshot
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: '11764694534'
+          run-id: 38290673759
+          github-token: ${{ github.token }}
+          path: site
+          merge-multiple: true
+      - name: Append and verify exact immutable metro mirror
+        run: python publishing/append_metro.py site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+          retention-days: 1
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - id: deployment
+        uses: actions/deploy-pages@v4
