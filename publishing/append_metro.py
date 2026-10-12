@@ -1,5 +1,5 @@
 """Append an exact metro subset to a verified existing public Pages snapshot."""
-import datetime, hashlib, json, math, shutil, sys
+import datetime, gzip, hashlib, io, json, math, shutil, sys, tarfile
 from pathlib import Path
 BOUNDS=[-88.65,41.35,-86.8,42.65]
 VERSION='8d555e92cfa68b53'
@@ -24,11 +24,20 @@ def main(site):
   out=dest/'tiles'/key;out.parent.mkdir(parents=True,exist_ok=True);out.write_bytes(data)
  version=hashlib.sha256(''.join(f'{k} {hashes[k]}\n' for k in sorted(hashes)).encode()).hexdigest()[:16]
  assert version==VERSION and len(hashes)==3868
+ archive=dest/'cycling-tile-database.tar.gz'
+ metadata=json.loads((Path(__file__).parent/'metro-source-metadata.json').read_text())
+ with archive.open('wb') as raw:
+  with gzip.GzipFile(filename='',mode='wb',fileobj=raw,mtime=0,compresslevel=9) as gz:
+   with tarfile.open(fileobj=gz,mode='w') as tar:
+    entries={**{k:v.encode() for k,v in metadata.items()},**{'tiles/'+k:(dest/'tiles'/k).read_bytes() for k in hashes}}
+    for name,data in sorted(entries.items()):
+     info=tarfile.TarInfo(name);info.size=len(data);info.mtime=0;info.mode=0o644;tar.addfile(info,io.BytesIO(data))
  prefix=f'{BASE}/regions/chicago-metro/{VERSION}'
  provenance=json.loads((src/'provenance.json').read_text());provenance.update(contentVersion=VERSION,kind='exact-native-tile-subset',bounds=BOUNDS,parentContentVersion='19785f3c1ca31233',retainsBoundaryTileGeometry=True)
  (dest/'provenance.json').write_text(json.dumps(provenance,indent=2)+'\n');(dest/'tile-sha256.json').write_text(json.dumps(hashes,sort_keys=True)+'\n')
  region=dict(manifest['regions'][0]);region.update(id='chicago-metro',name='Chicago metro',bounds=BOUNDS,version=VERSION,tiles=[prefix+'/tiles/{z}/{x}/{y}.pbf'],tileCount=len(hashes),tileBytes=size,sourceUrl=prefix+'/provenance.json',sha256Manifest=prefix+'/tile-sha256.json',mirrorOf='chicago-metro')
- # Public source database remains the broader unchanged parent snapshot.
+ region['sourceDownload']=prefix+'/cycling-tile-database.tar.gz'
+ region['sourceArchiveSha256']=hashlib.sha256(archive.read_bytes()).hexdigest()
  manifest['regions'].insert(0,region);manifest['updatedAt']=datetime.datetime.now(datetime.timezone.utc).isoformat()
  (site/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
  assert all(hashlib.sha256((site/k).read_bytes()).hexdigest()==v for k,v in old.items() if k!='manifest.json')
