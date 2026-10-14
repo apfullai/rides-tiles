@@ -1,0 +1,103 @@
+name: Refresh coverage and gradually add US cities
+on:
+  schedule:
+    - cron: '23 9 * * 1'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['config/rollout-request.json']
+permissions:
+  contents: read
+concurrency:
+  group: ride-tiles-pages
+  cancel-in-progress: false
+jobs:
+  budget:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      allowed: ${{ steps.budget.outputs.allowed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Reserve monthly runtime using public Actions history
+        id: budget
+        run: >-
+          timeout --signal=TERM --kill-after=5s 75s
+          python publishing/actions_budget.py
+          --repository "${GITHUB_REPOSITORY}"
+          --run-id "${GITHUB_RUN_ID}"
+          --attempt "${GITHUB_RUN_ATTEMPT}"
+  build:
+    needs: budget
+    if: needs.budget.outputs.allowed == 'true' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      changed: ${{ steps.rollout.outputs.changed == 'true' && steps.storage.outputs.allowed == 'true' }}
+      restored_manifest_sha256: ${{ steps.rollout.outputs.restored_manifest_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install official tools without caches
+        timeout-minutes: 2
+        run: |
+          sudo timeout --signal=TERM --kill-after=5s 70s apt-get update -qq
+          sudo timeout --signal=TERM --kill-after=5s 40s apt-get install -y osmium-tool
+          timeout --signal=TERM --kill-after=5s 30s python -m pip install --no-cache-dir --disable-pip-version-check -r requirements-dev.txt
+      - name: Verify offline safety tests before generation
+        timeout-minutes: 3
+        run: |
+          python -m unittest discover -s tests -v
+          python -m unittest discover -s publishing/tests -v
+      - name: Restore, refresh due coverage, and try at most one new city
+        id: rollout
+        timeout-minutes: 10
+        run: timeout --signal=TERM --kill-after=10s 540s python publishing/gradual_rollout.py
+      - name: Check active artifact storage before upload
+        id: storage
+        if: steps.rollout.outputs.changed == 'true'
+        timeout-minutes: 1
+        run: python publishing/artifact_budget.py --repository "${GITHUB_REPOSITORY}" --site site
+      - name: Upload only a changed and fully validated site
+        if: steps.rollout.outputs.changed == 'true' && steps.storage.outputs.allowed == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+          retention-days: 1
+  deploy:
+    needs: [budget, build]
+    if: needs.budget.outputs.allowed == 'true' && needs.build.outputs.changed == 'true' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Refuse to overwrite a changed live publication
+        env:
+          EXPECTED_MANIFEST_SHA256: ${{ needs.build.outputs.restored_manifest_sha256 }}
+        run: |
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'publishing')
+          from rollout_snapshot import assert_live_unchanged
+          assert_live_unchanged(os.environ['EXPECTED_MANIFEST_SHA256'])
+          PY
+      - uses: actions/configure-pages@v5
+      - name: Publish validated coverage atomically
+        id: deployment
+        uses: actions/deploy-pages@v4

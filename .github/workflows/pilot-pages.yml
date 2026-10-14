@@ -1,4 +1,4 @@
-name: Build and publish bounded cycling tile pilot
+name: Retired snapshot publisher (use gradual rollout)
 on:
   workflow_dispatch:
 permissions:
@@ -7,49 +7,10 @@ concurrency:
   group: ride-tiles-pages
   cancel-in-progress: false
 jobs:
-  build:
+  retired:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 1
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install official distribution tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y osmium-tool
-          python -m pip install --disable-pip-version-check -r requirements-dev.txt
-      - name: Validate tile generation and bounds
-        run: python -m unittest discover -s tests -v
-      - name: Generate the bounded public pilot
-        timeout-minutes: 18
-        run: python tools/build_region.py
-      - name: Preserve exact Chicago metro mirror in all full rebuilds
-        run: python publishing/append_metro.py site
-      - name: Preserve reviewable pilot artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ride-tiles-pilot
-          path: site/
-          if-no-files-found: error
-          retention-days: 2
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-          retention-days: 1
-  deploy:
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - uses: actions/configure-pages@v5
-      - name: Publish only the validated public tile output
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - run: |
+          echo 'This legacy publisher is retired to prevent rollback of expanded coverage.'
+          echo 'Run rollout.yml using a fresh workflow dispatch. It restores the latest live snapshot and checks the monthly budget.'

@@ -12,6 +12,68 @@ class TilesTest(unittest.TestCase):
   for tags,want in [({'highway':'cycleway'},'trail'),({'highway':'residential','cycleway':'track'},'protected'),({'cycleway':'lane'},'lane'),({'highway':'path','bicycle':'yes'},'shared_path'),({'highway':'track'},'track'),({'cycleway':'shared_lane'},'shared_lane')]:
    self.assertEqual(g.classify(tags),want)
   self.assertIsNone(g.classify({'highway':'cycleway','access':'private'}))
+ def test_explicit_bicycle_restrictions(self):
+  # Restrictions win over infrastructure tags and a general access permission.
+  infrastructure=[{'highway':'cycleway'},{'cycleway':'track'},{'cycleway':'lane'},
+                  {'highway':'path'},{'highway':'track'},{'cycleway':'shared_lane'}]
+  for base in infrastructure:
+   for bicycle in ('no','private','dismount','use_sidepath'):
+    for access in (None,'yes','permissive','no','private'):
+     tags={**base,'bicycle':bicycle}
+     if access is not None:tags['access']=access
+     with self.subTest(tags=tags):self.assertIsNone(g.classify(tags))
+ def test_generic_access_restrictions_need_explicit_bicycle_permission(self):
+  for access in ('no','private'):
+   for bicycle in (None,'','unknown','destination','customers','discouraged','yes;no'):
+    for base in ({'highway':'cycleway'},{'highway':'track'},{'cycleway':'lane'}):
+     tags={**base,'access':access}
+     if bicycle is not None:tags['bicycle']=bicycle
+     with self.subTest(tags=tags):self.assertIsNone(g.classify(tags))
+ def test_bicycle_permission_overrides_generic_access(self):
+  infrastructure=[({'highway':'cycleway'},'trail'),({'cycleway':'track'},'protected'),
+                  ({'cycleway':'lane'},'lane'),({'highway':'path'},'shared_path'),
+                  ({'highway':'track'},'track'),({'cycleway':'shared_lane'},'shared_lane')]
+  for access in ('no','private'):
+   for bicycle in ('yes','designated','official','permissive'):
+    for base,kind in infrastructure:
+     tags={**base,'access':access,'bicycle':bicycle}
+     want='trail' if base.get('highway')=='path' and bicycle=='designated' else kind
+     with self.subTest(tags=tags):self.assertEqual(g.classify(tags),want)
+ def test_track_access_is_not_inferred(self):
+  for tags in ({'highway':'track'},{'highway':'track','access':'unknown'},
+               {'highway':'track','bicycle':'unknown'}):
+   original=tags.copy()
+   with self.subTest(tags=tags):
+    self.assertEqual(g.classify(tags),'track')
+    self.assertEqual(tags,original)
+ def test_access_filter_and_properties_in_generated_mvt(self):
+  permitted=[{'name':f'{access}-{bicycle}','highway':'cycleway','access':access,'bicycle':bicycle}
+             for access in ('no','private') for bicycle in ('yes','designated','official','permissive')]
+  permitted += [{'name':'track-untagged','highway':'track'},
+                {'name':'track-unknown','highway':'track','access':'unknown','bicycle':'unknown'}]
+  denied=[{'name':f'denied-{access}','highway':'cycleway','access':access} for access in ('no','private')]
+  denied += [{'name':f'denied-{bicycle}','highway':'track','bicycle':bicycle,'access':'yes'}
+             for bicycle in ('no','private','dismount','use_sidepath')]
+  for nested in (False,True):
+   with self.subTest(nested_tags=nested), tempfile.TemporaryDirectory() as td, patch.object(g,'BBOX',(-74.05,40.65,-73.85,40.9)):
+    p=Path(td);src=p/'sample.jsonl';out=p/'output';features=[]
+    for fid,tags in enumerate(permitted+denied,1):
+     props={'id':fid,'tags':tags} if nested else {'id':fid,**tags}
+     features.append({'type':'Feature','properties':props,'geometry':{'type':'LineString','coordinates':[[-74,40.7],[-73.99,40.71]]}})
+    src.write_text('\n'.join(map(json.dumps,features)))
+    report=g.generate(src,out,range(8,9))
+    self.assertEqual(report['features_by_category'],{'trail':8,'track':2})
+    decoded=[]
+    for tile in (out/'tiles').rglob('*.pbf'):
+     decoded.extend(mapbox_vector_tile.decode(gzip.decompress(tile.read_bytes()))['cycleinfra']['features'])
+    by_name={f['properties']['name']:f['properties'] for f in decoded}
+    self.assertEqual(set(by_name),{tags['name'] for tags in permitted})
+    for tags in permitted:
+     props=by_name[tags['name']]
+     self.assertEqual(props['kind'],'track' if tags['highway']=='track' else 'trail')
+     for key in ('access','bicycle'):
+      if key in tags:self.assertEqual(props[key],tags[key])
+      else:self.assertNotIn(key,props)
  def test_region_validation(self):
   good={'id':'nyc-pilot','bounds':[-74.05,40.65,-73.85,40.9],'minzoom':8,'maxzoom':14,'sourceStates':['new-york']}
   validate_config(good)

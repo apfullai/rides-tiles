@@ -22,8 +22,29 @@ def validate_config(c):
     w,s,e,n=c['bounds'];assert -180<=w<e<=180 and -85<=s<n<=85
     assert 8<=c['minzoom']<=c['maxzoom']<=14
     assert 0<(e-w)*(n-s)<=6
-    assert 1<=len(c['sourceStates'])<=3
+    assert 1<=len(c['sourceStates'])<=(4 if c['id']=='chicagoland' and c['bounds']==[-89,41.05,-86.65,43.25] else 3)
     assert all(re.fullmatch('[a-z-]+',v) for v in c['sourceStates'])
+
+def download_source(url, destination):
+    # Rollout children share a conservative per-run download ledger. No retries
+    # there: a failed transfer keeps its entire reserved byte allowance charged.
+    ledger_path=os.environ.get('RIDE_DOWNLOAD_LEDGER')
+    maximum=MAX_SOURCE_BYTES
+    if ledger_path:
+        ledger=Path(ledger_path)
+        state=json.loads(ledger.read_text()) if ledger.exists() else {'reservedBytes':0}
+        spent=state['reservedBytes']
+        if type(spent) is not int or not 0<=spent<=3_000_000_000:
+            raise RuntimeError('Invalid download budget ledger')
+        maximum=min(MAX_SOURCE_BYTES,3_000_000_000-spent)
+        if maximum<=1_000_000:raise RuntimeError('Cumulative download budget exhausted')
+        ledger.write_text(json.dumps({'reservedBytes':spent+maximum}))
+    run('curl','--fail','--location','--proto','=https','--proto-redir','=https','--retry','0' if ledger_path else '2',
+        '--connect-timeout','20','--max-time','180' if ledger_path else '600',
+        '--max-filesize',str(maximum),url,'-o',str(destination))
+    if destination.stat().st_size>maximum:raise RuntimeError('Source exceeded download reservation')
+    if ledger_path:
+        ledger.write_text(json.dumps({'reservedBytes':spent+destination.stat().st_size}))
 
 def build(c, work, site, base):
     validate_config(c)
@@ -32,7 +53,7 @@ def build(c, work, site, base):
     for state in c['sourceStates']:
         url=f'https://download.geofabrik.de/north-america/us/{state}-latest.osm.pbf'
         src=work/f'{state}.osm.pbf';filtered=work/f'{state}-filtered.osm.pbf';crop=work/f'{state}-cropped.osm.pbf'
-        run('curl','--fail','--location','--retry','2','--connect-timeout','30','--max-time','600','--max-filesize',str(MAX_SOURCE_BYTES),url,'-o',str(src))
+        download_source(url,src)
         if not 1_000_000<src.stat().st_size<=MAX_SOURCE_BYTES:raise RuntimeError('Source size outside safety bounds')
         timestamp=subprocess.check_output(['osmium','fileinfo','-g','header.option.osmosis_replication_timestamp',str(src)],text=True).strip()
         if not timestamp:raise RuntimeError('Missing OSM source replication timestamp')

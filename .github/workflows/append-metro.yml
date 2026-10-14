@@ -1,4 +1,4 @@
-name: Append exact Chicago metro mirror without regeneration
+name: Retired snapshot publisher (use gradual rollout)
 on:
   workflow_dispatch:
 permissions:
@@ -7,34 +7,10 @@ concurrency:
   group: ride-tiles-pages
   cancel-in-progress: false
 jobs:
-  build:
+  retired:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
-    permissions:
-      contents: read
+    timeout-minutes: 1
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Restore hash-pinned public snapshot without network downloads
-        run: python publishing/restore_snapshot.py site
-      - name: Append and verify exact immutable metro mirror
-        run: python publishing/append_metro.py site
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-          retention-days: 1
-  deploy:
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - uses: actions/configure-pages@v5
-      - id: deployment
-        uses: actions/deploy-pages@v4
+      - run: |
+          echo 'This legacy publisher is retired to prevent rollback of expanded coverage.'
+          echo 'Run rollout.yml using a fresh workflow dispatch. It restores the latest live snapshot and checks the monthly budget.'

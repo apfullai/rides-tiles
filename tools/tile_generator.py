@@ -4,14 +4,21 @@ from collections import defaultdict,Counter
 from shapely.geometry import shape,box,LineString
 
 BBOX=None # Required from the explicit region configuration
+BICYCLE_PERMISSIONS=('yes','designated','official','permissive')
 def classify(tags):
- if tags.get('bicycle') in ('no','private') or tags.get('access')=='private':return None
+ # Mode-specific permission overrides generic access restrictions in OSM:
+ # https://wiki.openstreetmap.org/wiki/Key:access#Transport_mode_restrictions
+ # This static infrastructure filter is not a complete legal-access resolver.
+ bicycle=tags.get('bicycle')
+ if bicycle in ('no','private','dismount','use_sidepath'):return None
+ if tags.get('access') in ('no','private') and bicycle not in BICYCLE_PERMISSIONS:return None
  h=tags.get('highway','')
  v=[str(tags.get(t,'')) for t in ('cycleway','cycleway:left','cycleway:right','cycleway:both')]
  if h=='cycleway' or h in ('path','footway','pedestrian') and tags.get('bicycle')=='designated':return 'trail'
  if 'track' in v or 'protected_lane' in v:return 'protected'
  if 'lane' in v or 'buffered_lane' in v:return 'lane'
- if h in ('path','footway','pedestrian') and tags.get('bicycle') in ('yes','designated','official','permissive'):return 'shared_path'
+ if h in ('path','footway','pedestrian') and bicycle in BICYCLE_PERMISSIONS:return 'shared_path'
+ # A track with absent/unknown access remains a track, not a promise of access.
  if h=='track':return 'track'
  if 'shared_lane' in v or 'share_busway' in v:return 'shared_lane'
  return None
@@ -56,7 +63,7 @@ def encode_tile(features,x,y,z):
   path=geom(lines,x,y,z)
   if not path:continue
   props={'kind':kind}
-  for k in ('name','highway','surface','bicycle','cycleway','cycleway:left','cycleway:right','cycleway:both','segregated','ref'):
+  for k in ('name','highway','surface','bicycle','access','cycleway','cycleway:left','cycleway:right','cycleway:both','segregated','ref'):
    if tags.get(k)is not None:props[k]=str(tags[k])[:90]
   ids=[]
   for k,v in props.items():
