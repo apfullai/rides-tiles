@@ -100,7 +100,8 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(before, inventory(self.site))
 
     def test_corrupt_tiles_do_not_mutate(self):
-        tile = next((self.site / 'regions').rglob('*.pbf'))
+        tiles = self.site / 'regions/nyc-pilot/920c1bc3710f6eaa/tiles'
+        tile = sorted(tiles.rglob('*.pbf'))[0]
         tile.write_bytes(b'corrupt')
         before = inventory(self.site)
         with self.assertRaises(ValueError):
