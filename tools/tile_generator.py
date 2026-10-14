@@ -121,3 +121,96 @@ def generate(source,output,zooms=range(8,15)):
  (output/'tilejson.json').write_text(json.dumps({'tilejson':'3.0.0','name':meta['name'],'bounds':BBOX,'minzoom':min(zooms),'maxzoom':max(zooms),'scheme':'xyz','tiles':['tiles/{z}/{x}/{y}.pbf'],'attribution':meta['attribution'],'vector_layers':[{'id':'cycleinfra','fields':{'kind':'String','name':'String','surface':'String'},'minzoom':min(zooms),'maxzoom':max(zooms)}]},indent=2)+'\n')
  report={'generated_utc':dt.datetime.now(dt.timezone.utc).isoformat(),'bounds':BBOX,'features_by_category':dict(counts),'nonempty_tiles':total,'mbtiles_bytes':(output/'cycling.mbtiles').stat().st_size}
  (output/'report.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report,indent=2));return report
+
+# Restartable generation keeps the original parser, ordering and feature-ID
+# arithmetic. Tile encoding is deliberately shared with generate() above.
+def build_feature_index(source, database, bbox, zooms=range(8,15), batch_size=128):
+ """Index the complete canonical export once, before splitting any tiles."""
+ import hashlib
+ from shapely import wkb
+ zooms=tuple(zooms)
+ if not zooms or type(batch_size)is not int or not 1<=batch_size<=512:
+  raise RuntimeError('Invalid resumable generation parameters')
+ database=Path(database)
+ if database.exists():raise RuntimeError('Feature index must be created fresh')
+ db=sqlite3.connect(str(database));counts=Counter();seen=set();region=box(*bbox);ordinal=0
+ try:
+  db.executescript('''
+   CREATE TABLE features(ordinal INTEGER PRIMARY KEY,fid INTEGER NOT NULL,kind TEXT NOT NULL,geometry BLOB NOT NULL,tags TEXT NOT NULL);
+   CREATE TABLE tile_features(z INTEGER NOT NULL,x INTEGER NOT NULL,y INTEGER NOT NULL,ordinal INTEGER NOT NULL);
+   CREATE TABLE candidates(position INTEGER PRIMARY KEY,batch_id INTEGER NOT NULL,z INTEGER NOT NULL,x INTEGER NOT NULL,y INTEGER NOT NULL,UNIQUE(z,x,y));
+   CREATE TABLE metadata(name TEXT PRIMARY KEY,value TEXT NOT NULL);
+  ''')
+  with open(source,'rb') as fd:
+   for line in fd:
+    line=line.strip().lstrip(b'\x1e')
+    if not line:continue
+    try:f=json.loads(line)
+    except ValueError:continue
+    tags=f.get('properties') or {}
+    if isinstance(tags.get('tags'),dict):tags={**tags,**tags['tags']}
+    kind=classify(tags)
+    if not kind or not f.get('geometry'):continue
+    try:g=shape(f['geometry'])
+    except Exception:continue
+    if g.is_empty or g.geom_type not in ('LineString','MultiLineString') or not g.intersects(region):continue
+    identity=str(tags.get('id') or tags.get('@id') or tags.get('osm_id') or '')
+    if identity and identity in seen:continue
+    if identity:seen.add(identity)
+    g=g.intersection(region)
+    if g.is_empty:continue
+    fid=len(seen)+sum(counts.values())+1
+    db.execute('INSERT INTO features VALUES(?,?,?,?,?)',(ordinal,fid,kind,wkb.dumps(g),json.dumps(tags,separators=(',',':'))))
+    for z in zooms:
+     db.executemany('INSERT INTO tile_features VALUES(?,?,?,?)',((z,x,y,ordinal) for x,y in spread(g.bounds,z)))
+    counts[kind]+=1;ordinal+=1
+  if not counts:raise RuntimeError('Source has no cycling ways; refusing empty tiles')
+  db.execute('CREATE INDEX tile_feature_order ON tile_features(z,x,y,ordinal)')
+  candidates=list(db.execute('SELECT DISTINCT z,x,y FROM tile_features ORDER BY z,x,y'))
+  if not candidates or len(candidates)>100_000:raise RuntimeError('Candidate tile count outside bound')
+  batches=[]
+  for start in range(0,len(candidates),batch_size):
+   batch_id=start//batch_size
+   coords=candidates[start:start+batch_size]
+   paths=[f'tiles/{z}/{x}/{y}.pbf' for z,x,y in coords]
+   encoded=json.dumps(paths,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+   batches.append({'tiles':paths,'digest':hashlib.sha256(encoded).hexdigest()})
+   db.executemany('INSERT INTO candidates VALUES(?,?,?,?,?)',((start+i,batch_id,z,x,y) for i,(z,x,y) in enumerate(coords)))
+  db.execute('CREATE INDEX candidate_batch ON candidates(batch_id,position)')
+  summary={'bounds':list(bbox),'zooms':list(zooms),'featuresByCategory':dict(counts),'featureCount':ordinal,
+           'candidateTileCount':len(candidates),'batchSize':batch_size,'batchCount':len(batches),
+           'batchIds':list(range(len(batches))),'batches':batches}
+  db.executemany('INSERT INTO metadata VALUES(?,?)',((key,json.dumps(value,separators=(',',':'))) for key,value in summary.items()))
+  db.commit()
+  if db.execute('PRAGMA integrity_check').fetchone()!=('ok',):raise RuntimeError('Invalid canonical feature index')
+ finally:db.close()
+ return summary
+
+def generate_tile_batch(database, output, batch_id):
+ """Encode a disjoint slice, preserving full-region feature order and IDs."""
+ import hashlib
+ from shapely import wkb
+ if type(batch_id)is not int or batch_id<0:raise RuntimeError('Invalid batch ID')
+ output=Path(output);output.mkdir(parents=True,exist_ok=True)
+ # Read-only URI prevents accidental re-creation of a missing or corrupt index.
+ db=sqlite3.connect(Path(database).resolve().as_uri()+'?mode=ro',uri=True)
+ try:
+  summary={key:json.loads(value) for key,value in db.execute('SELECT name,value FROM metadata')}
+  if batch_id not in summary['batchIds']:raise RuntimeError('Unplanned tile batch')
+  candidates=list(db.execute('SELECT z,x,y FROM candidates WHERE batch_id=? ORDER BY position',(batch_id,)))
+  paths=[f'tiles/{z}/{x}/{y}.pbf' for z,x,y in candidates]
+  expected=summary['batches'][batch_id]
+  if paths!=expected['tiles']:raise RuntimeError('Corrupt canonical batch coverage')
+  hashes={}
+  for (z,x,y),relative in zip(candidates,paths):
+   features=[]
+   for fid,kind,geometry,tags in db.execute('SELECT f.fid,f.kind,f.geometry,f.tags FROM tile_features AS tf JOIN features AS f ON f.ordinal=tf.ordinal WHERE tf.z=? AND tf.x=? AND tf.y=? ORDER BY tf.ordinal',(z,x,y)):
+    features.append((fid,kind,wkb.loads(geometry),json.loads(tags)))
+   tile=encode_tile(features,x,y,z)
+   if not tile:continue
+   if len(tile)>2_000_000:raise RuntimeError('Generated tile exceeds size bound')
+   path=output/relative;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(tile)
+   hashes[relative]=hashlib.sha256(tile).hexdigest()
+ finally:db.close()
+ return {'batchId':batch_id,'candidateTiles':paths,'candidateDigest':expected['digest'],
+         'nonemptyTiles':len(hashes),'tileHashes':hashes}

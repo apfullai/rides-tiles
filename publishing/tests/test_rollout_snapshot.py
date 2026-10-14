@@ -98,7 +98,11 @@ class DurableSnapshotTests(unittest.TestCase):
         self.assertEqual(actual, manifest)
         self.assertEqual(snapshot.inventory(restored), before)
         self.assertEqual((restored / 'rollout-state.json').read_bytes(), (self.site / 'rollout-state.json').read_bytes())
-        self.assertEqual(receipt, {'bootstrap': False, 'liveManifestSha256': snapshot.digest(files[snapshot.BASE + '/manifest.json'])})
+        self.assertEqual(receipt, {'bootstrap': False,
+            'liveManifestSha256': snapshot.digest(files[snapshot.BASE + '/manifest.json']),
+            'liveSnapshotSha256': snapshot.digest(files[snapshot.BASE + '/snapshot.json']),
+            'publicationRevision': snapshot.publication_revision(files[snapshot.BASE + '/manifest.json'],
+                                                                 files[snapshot.BASE + '/snapshot.json'])})
         self.assertEqual(report['siteBytes'], sum(len(v) for v in files.values()))
         self.assertEqual(snapshot.validate_site(restored), manifest)
 

@@ -402,7 +402,31 @@ def restore_published(site, base_url=BASE, fetch=None, receipt=None):
     if receipt is not None:
         receipt['liveManifestSha256'] = digest(live)
         receipt['bootstrap'] = raw is None
+        receipt['liveSnapshotSha256'] = digest(raw) if raw is not None else None
+        receipt['publicationRevision'] = publication_revision(live, raw)
     return result
+
+
+def publication_revision(manifest_bytes, descriptor_bytes):
+    """Bind checkpoint-only publications as well as client-visible coverage."""
+    return digest(json.dumps({'manifestSha256': digest(manifest_bytes),
+        'snapshotSha256': digest(descriptor_bytes) if descriptor_bytes is not None else None},
+        sort_keys=True, separators=(',', ':')).encode())
+
+
+def assert_publication_unchanged(expected_revision, base_url=BASE, fetch=None):
+    expected_revision = _hash(expected_revision)
+    fetch = fetch or _fetch
+    live = _get(fetch, base_url.rstrip('/')+'/manifest.json', MAX_MANIFEST_BYTES)
+    try:
+        snapshot = _get(fetch, base_url.rstrip('/')+'/'+DESCRIPTOR, MAX_FILE_BYTES)
+    except HTTPError as exc:
+        if exc.code != 404:
+            raise
+        snapshot = None
+    if publication_revision(live, snapshot) != expected_revision:
+        raise ValueError('Live publication revision changed since restore; refusing stale checkpoint')
+    return expected_revision
 
 
 def assert_live_unchanged(expected_sha, base_url=BASE, fetch=None):

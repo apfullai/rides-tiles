@@ -2,7 +2,14 @@ name: Refresh coverage and gradually add US cities
 on:
   schedule:
     - cron: '23 9 * * 1'
+    - cron: '23 9 * * 0,2-6'
   workflow_dispatch:
+    inputs:
+      start_region:
+        description: Existing mutable region to start when no city is active (blank for normal selection)
+        type: string
+        required: false
+        default: ""
   push:
     branches: [main]
     paths: ['config/rollout-request.json']
@@ -18,11 +25,20 @@ jobs:
     timeout-minutes: 2
     outputs:
       allowed: ${{ steps.budget.outputs.allowed }}
+      allow_new: ${{ steps.ready.outputs.allow_new }}
+      start_region: ${{ steps.ready.outputs.start_region }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Check weekly selection or active-city continuation
+        id: ready
+        env:
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          REQUESTED_START_REGION: ${{ inputs.start_region }}
+        run: timeout --signal=TERM --kill-after=5s 15s python publishing/continuation_gate.py
       - name: Reserve monthly runtime using public Actions history
+        if: steps.ready.outputs.eligible == 'true'
         id: budget
         run: >-
           timeout --signal=TERM --kill-after=5s 75s
@@ -37,7 +53,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       changed: ${{ steps.rollout.outputs.changed == 'true' && steps.storage.outputs.allowed == 'true' }}
-      restored_manifest_sha256: ${{ steps.rollout.outputs.restored_manifest_sha256 }}
+      restored_publication_revision: ${{ steps.rollout.outputs.restored_publication_revision }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,15 +67,17 @@ jobs:
           sudo timeout --signal=TERM --kill-after=5s 70s apt-get update -qq
           sudo timeout --signal=TERM --kill-after=5s 40s apt-get install -y osmium-tool
           timeout --signal=TERM --kill-after=5s 30s python -m pip install --no-cache-dir --disable-pip-version-check -r requirements-dev.txt
-      - name: Verify offline safety tests before generation
-        timeout-minutes: 5
-        run: |
-          python -m unittest discover -s tests -v
-          python -m unittest discover -s publishing/tests -v
-      - name: Restore, refresh due coverage, and try at most one new city
+      - name: Verify code and advance one durable city checkpoint
         id: rollout
         timeout-minutes: 10
-        run: timeout --signal=TERM --kill-after=10s 540s python publishing/gradual_rollout.py
+        env:
+          ALLOW_NEW: ${{ needs.budget.outputs.allow_new }}
+          START_REGION: ${{ needs.budget.outputs.start_region }}
+        run: |
+          args=(--continue-only)
+          if [ "$ALLOW_NEW" = true ]; then args=(--allow-new); fi
+          if [ -n "$START_REGION" ]; then args+=(--start-region "$START_REGION"); fi
+          timeout --signal=TERM --kill-after=10s 540s python publishing/resumable_rollout.py "${args[@]}"
       - name: Check active artifact storage before upload
         id: storage
         if: steps.rollout.outputs.changed == 'true'
@@ -89,13 +107,13 @@ jobs:
           persist-credentials: false
       - name: Refuse to overwrite a changed live publication
         env:
-          EXPECTED_MANIFEST_SHA256: ${{ needs.build.outputs.restored_manifest_sha256 }}
+          EXPECTED_PUBLICATION_REVISION: ${{ needs.build.outputs.restored_publication_revision }}
         run: |
           python - <<'PY'
           import os, sys
           sys.path.insert(0, 'publishing')
-          from rollout_snapshot import assert_live_unchanged
-          assert_live_unchanged(os.environ['EXPECTED_MANIFEST_SHA256'])
+          from rollout_snapshot import assert_publication_unchanged
+          assert_publication_unchanged(os.environ['EXPECTED_PUBLICATION_REVISION'])
           PY
       - uses: actions/configure-pages@v5
       - name: Publish validated coverage atomically
