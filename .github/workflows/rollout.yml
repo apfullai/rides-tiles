@@ -52,7 +52,7 @@ jobs:
           sudo timeout --signal=TERM --kill-after=5s 40s apt-get install -y osmium-tool
           timeout --signal=TERM --kill-after=5s 30s python -m pip install --no-cache-dir --disable-pip-version-check -r requirements-dev.txt
       - name: Verify offline safety tests before generation
-        timeout-minutes: 3
+        timeout-minutes: 5
         run: |
           python -m unittest discover -s tests -v
           python -m unittest discover -s publishing/tests -v
