@@ -1,15 +1,6 @@
 name: Build and publish bounded cycling tile pilot
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'tools/**'
-      - 'bootstrap/**'
-      - 'config/pilot-regions.json'
-      - 'requirements.txt'
-      - 'requirements-dev.txt'
-      - 'tests/**'
 permissions:
   contents: read
 concurrency:

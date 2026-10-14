@@ -2,8 +2,8 @@
 import gzip,hashlib,io,json,re,tarfile
 from pathlib import Path
 
-def import_chicagoland(site,base):
-    root=Path(__file__).resolve().parents[1]/'bootstrap'
+def import_chicagoland(site,base,bootstrap=None):
+    root=Path(bootstrap) if bootstrap is not None else Path(__file__).resolve().parents[1]/'bootstrap'
     conf=json.loads((root/'chicagoland.json').read_text())
     packed=b''.join(p.read_bytes() for p in sorted(root.glob('chicagoland.tar.gz.part*')))
     if hashlib.sha256(packed).hexdigest()!=conf['archiveSha256']:raise RuntimeError('Mirror archive digest mismatch')

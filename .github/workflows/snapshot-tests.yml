@@ -1,0 +1,23 @@
+name: Verify offline snapshot maintenance
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['publishing/**', 'bootstrap/**', 'tools/import_mirror.py', '.github/workflows/**']
+  push:
+    branches: [main]
+    paths: ['publishing/**', 'bootstrap/**', 'tools/import_mirror.py', '.github/workflows/**']
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test offline reconstruction, preservation and integrity guards
+        run: python -m unittest discover -s publishing/tests -v
