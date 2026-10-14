@@ -185,6 +185,85 @@ class ResumableRolloutTests(unittest.TestCase):
         self.assertTrue(result['needsAttention'])
         self.assertEqual(result['completedCounts']['sources'],0)
 
+    def test_source_group_can_publish_a_contiguous_verified_prefix(self):
+        def group(req,cp,work,seconds):
+            result,out=self.execute(req,cp,work,seconds)
+            result['progress']['completedStates']=['state-a','state-b']
+            result['sourceGroup']={'completedStates':['state-a','state-b'],'remainingStates':[], 'plannedPause':False}
+            r.write_json(cp/'progress.json',result['progress'])
+            return result,out
+        result=self.advance(allow_new=True,execute=group)
+        self.assertFalse(result['needsAttention']);self.assertEqual(result['completedCounts']['sources'],2)
+        self.assertEqual(result['stage'],'index')
+
+    def test_source_group_cannot_skip_a_state_or_alter_prior_source_files(self):
+        self.advance(allow_new=True)
+        cp=self.site/r.ACTIVE
+        (cp/'sources/state-a').mkdir(parents=True)
+        (cp/'sources/state-a/receipt.json').write_text('immutable')
+        descriptor=json.loads((cp/r.DESCRIPTOR).read_text());r.save_checkpoint(self.site,descriptor)
+        def alter(req,checkpoint,work,seconds):
+            result,out=self.execute(req,checkpoint,work,seconds)
+            (checkpoint/'sources/state-a/receipt.json').write_text('altered')
+            return result,out
+        result=self.advance(execute=alter)
+        self.assertTrue(result['needsAttention']);self.assertIn('previously completed',result['reason'])
+        self.assertEqual((cp/'sources/state-a/receipt.json').read_text(),'immutable')
+        before=r.empty_progress(self.configs[0]);after={**before,'completedStates':['state-b']}
+        with self.assertRaisesRegex(ValueError,'unexpected'):
+            r.validate_transition(self.configs[0],before,after,{'kind':'start'})
+
+    def test_source_group_cooperative_pause_is_not_a_failure(self):
+        self.advance(allow_new=True)
+        def pause(req,cp,work,seconds):
+            progress=self.inspector(req['config'],req['sourcePlan'],cp)
+            return {'schemaVersion':1,'sourcePlan':req['sourcePlan'],'progress':progress,'plannedPause':True,
+                    'sourceGroup':{'completedStates':[],'remainingStates':['state-b'],'plannedPause':True}},work/'unused'
+        result=self.advance(execute=pause)
+        self.assertFalse(result['needsAttention']);self.assertIsNone(result['retryAfter'])
+        self.assertEqual(result['completedCounts']['sources'],1)
+
+    def test_authorized_migration_preserves_generation_and_source_then_resumes(self):
+        import checkpoint_migrations
+        self.configs[0]['sourceStates']=['illinois','wisconsin']
+        self.advance(allow_new=True)
+        cp=self.site/r.ACTIVE;source=cp/'sources/illinois';source.mkdir(parents=True)
+        raw=b'unchanged crop';digest=hashlib.sha256(raw).hexdigest()
+        (source/'crop.part-0000').write_bytes(raw)
+        r.write_json(source/'receipt.json',{'crop':{'encoding':'raw','bytes':len(raw),'sha256':digest,
+            'parts':[{'path':'crop.part-0000','bytes':len(raw),'sha256':digest}]}})
+        descriptor=json.loads((cp/r.DESCRIPTOR).read_text());r.save_checkpoint(self.site,descriptor)
+        before=r.checkpoint_files(cp);manifest_before=(self.site/'manifest.json').read_bytes()
+        pin=hashlib.sha256((cp/r.DESCRIPTOR).read_bytes()).hexdigest();clock=[0]
+        def verify(*a,**k):clock[0]=160;return {'fingerprint':'a'*64},'full-tests'
+        with patch.object(checkpoint_migrations,'FROM_DESCRIPTOR',pin), \
+             patch.object(checkpoint_migrations,'FROM_CODE',CODE):
+            result=self.advance(fingerprinter=lambda root:'a'*64,verifier=verify,deadline=200,monotonic=lambda:clock[0])
+        self.assertTrue(result['changed']);self.assertEqual(before,r.checkpoint_files(cp))
+        current=json.loads((cp/r.DESCRIPTOR).read_text())
+        for field in ('generationId','sourcePlan','config','progress','files'):
+            self.assertEqual(current[field],descriptor[field])
+        self.assertEqual(current['codeFingerprint'],'a'*64)
+        self.assertEqual((self.site/'manifest.json').read_bytes(),manifest_before)
+        audit=json.loads((self.site/'rollout-state.json').read_text())['checkpointMigrations']
+        self.assertEqual(len(audit),1);self.assertEqual(audit[0]['generationId'],descriptor['generationId'])
+        for number in range(5):
+            result=self.advance(fingerprinter=lambda root:'a'*64,verifier=lambda *a,**k:({'fingerprint':'a'*64},'verified'))
+        self.assertFalse(result['active'])
+        self.assertEqual(json.loads((self.site/'rollout-state.json').read_text())['checkpointMigrations'],audit)
+
+    def test_migration_is_not_saved_when_current_verification_fails(self):
+        import checkpoint_migrations
+        self.advance(allow_new=True)
+        before=r.inventory(self.site)
+        with patch.object(checkpoint_migrations,'eligible',return_value=True), \
+             patch.object(checkpoint_migrations,'migrate') as migrate:
+            with self.assertRaisesRegex(RuntimeError,'tests failed'):
+                self.advance(fingerprinter=lambda root:'a'*64,
+                             verifier=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('tests failed')))
+            migrate.assert_not_called()
+        self.assertEqual(before,r.inventory(self.site))
+
     def test_short_after_verification_persists_verified_pending_start(self):
         clock=[0]
         def verify(*args,**kwargs):clock[0]=550;return {'fingerprint':CODE},'full-tests'

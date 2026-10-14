@@ -24,6 +24,7 @@ import urllib.request
 
 import build_region as legacy
 import tile_generator as generator
+from source_package import FORMAT as SOURCE_FORMAT, write_source_package, validate_source_package
 
 SCHEMA = 1
 CHUNK_BYTES = 8_000_000
@@ -486,6 +487,55 @@ def build_source_stage(config, plan, state, work, checkpoint):
     return receipt
 
 
+def build_source_group(config, plan, checkpoint, work, seconds=240, reserve_seconds=30):
+    """Acquire a configured prefix without repeating already verified crops."""
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or not 0 < seconds <= 285:
+        raise RuntimeError('Invalid source-group time budget')
+    if not isinstance(reserve_seconds, (int, float)) or isinstance(reserve_seconds, bool) or not 0 <= reserve_seconds < seconds:
+        raise RuntimeError('Invalid source-group safety reserve')
+    deadline = time.monotonic() + seconds
+    status = validate_checkpoint(config, plan, checkpoint)
+    missing = [state for state in config['sourceStates'] if state not in status['completedStates']]
+    completed = []
+    slowest = 30.0
+    for state in missing:
+        if deadline - time.monotonic() <= reserve_seconds + 2 * slowest:
+            break
+        started = time.monotonic()
+        build_source_stage(config, plan, state, work, checkpoint)
+        completed.append(state)
+        slowest = max(slowest, time.monotonic() - started)
+    remaining = [state for state in missing if state not in completed]
+    return {'completedStates': completed, 'remainingStates': remaining, 'plannedPause': bool(remaining)}
+
+
+def compact_source_crops(config, plan, checkpoint, index):
+    """Discard only redundant active-work payloads in a disposable candidate.
+
+    The complete canonical source and index have already been independently
+    reconstructed and verified. The publisher must commit the candidate only
+    after this whole operation validates; interruption cannot affect the prior
+    published checkpoint. Historical region data is never touched here.
+    """
+    checkpoint = Path(checkpoint)
+    for state in config['sourceStates']:
+        root = checkpoint / 'sources' / state
+        receipt = verify_receipt(root, plan['planId'], 'source')
+        original_hash = sha256(root / 'receipt.json')
+        if original_hash != index['sourceReceiptHashes'][state] or receipt['crop']['sha256'] != index['sourceCropHashes'][state]:
+            raise RuntimeError('Source changed before compaction')
+        expected_files = {part['path']: {'bytes': part['bytes'], 'sha256': part['sha256']} for part in receipt['crop']['parts']}
+        if receipt['files'] != expected_files:
+            raise RuntimeError('Unexpected source files before compaction')
+        for name in expected_files:
+            (root / safe_relative(name)).unlink()
+        receipt['files'] = {}
+        receipt['compactedInto'] = {'mergedSourceSha256': index['mergedSource']['sha256'],
+                                    'indexSha256': index['index']['sha256'],
+                                    'originalReceiptSha256': original_hash}
+        write_json(root / 'receipt.json', receipt)
+
+
 def build_index_stage(config, plan, checkpoint, work, batch_size=DEFAULT_BATCH_SIZE):
     validate_source_plan(config, plan, require_unexpired=False)
     if type(batch_size) is not int or not 1 <= batch_size <= 512:
@@ -511,8 +561,6 @@ def build_index_stage(config, plan, checkpoint, work, batch_size=DEFAULT_BATCH_S
             shutil.copyfile(crops[0], merged)
         else:
             legacy.run('osmium', 'merge', *map(str, crops), '-o', str(merged))
-        if merged.stat().st_size > MAX_FILE_BYTES:
-            raise RuntimeError('Public filtered source exceeds 24 MB file ceiling')
         sequence = temp / 'cycling.geojsonseq'
         legacy.run('osmium', 'export', '--attributes=id,type', '-f', 'geojsonseq', '-x', 'print_record_separator=false', str(merged), '-o', str(sequence))
         database = temp / 'features.sqlite'
@@ -522,8 +570,15 @@ def build_index_stage(config, plan, checkpoint, work, batch_size=DEFAULT_BATCH_S
         index = pack_file(database, staged, 'features', compress=True)
         merged_descriptor = pack_file(merged, staged, 'merged-source')
         receipt = make_receipt(staged, plan['planId'], 'index', index=index, mergedSource=merged_descriptor, runtime=plan['runtime'],
-                               sourceCropHashes={state: verify_receipt(checkpoint / 'sources' / state)['crop']['sha256'] for state in config['sourceStates']}, **summary)
+                               sourceCropHashes={state: verify_receipt(checkpoint / 'sources' / state)['crop']['sha256'] for state in config['sourceStates']},
+                               sourceReceiptHashes={state: sha256(checkpoint / 'sources' / state / 'receipt.json') for state in config['sourceStates']},
+                               compactedSourceCrops=True, **summary)
+        verify_receipt(staged, plan['planId'], 'index')
+        unpack_file(receipt['index'], staged, temp / 'verified-index.sqlite')
+        unpack_file(receipt['mergedSource'], staged, temp / 'verified-source.osm.pbf')
         commit_stage(staged, checkpoint / 'index')
+        compact_source_crops(config, plan, checkpoint, receipt)
+        validate_checkpoint(config, plan, checkpoint)
     return receipt
 
 
@@ -638,6 +693,7 @@ def validate_checkpoint(config, plan, checkpoint):
     allowed_states = set(config['sourceStates'])
     sources_dir = checkpoint / 'sources'
     timestamps = set()
+    compacted = {}
     if sources_dir.exists():
         if sources_dir.is_symlink() or any(not p.is_dir() or p.name not in allowed_states for p in sources_dir.iterdir()):
             raise RuntimeError('Unexpected source checkpoint directory')
@@ -647,6 +703,10 @@ def validate_checkpoint(config, plan, checkpoint):
                 continue
             receipt = verify_receipt(root, plan['planId'], 'source')
             timestamps.add(check_source_receipt(config, plan, state, receipt))
+            if 'compactedInto' in receipt:
+                if receipt['files']:
+                    raise RuntimeError('Compacted source still contains payload files')
+                compacted[state] = receipt
             result['completedStates'].append(state)
     if len(timestamps) > 1:
         raise RuntimeError('Mixed source replication timestamps in checkpoint')
@@ -658,6 +718,22 @@ def validate_checkpoint(config, plan, checkpoint):
         expected_hashes = {state: verify_receipt(sources_dir / state)['crop']['sha256'] for state in config['sourceStates']}
         if index.get('sourceCropHashes') != expected_hashes:
             raise RuntimeError('Canonical index source crop mismatch')
+        if index.get('compactedSourceCrops') is True:
+            if set(compacted) != allowed_states or set(index.get('sourceReceiptHashes', {})) != allowed_states:
+                raise RuntimeError('Incomplete source compaction')
+            for state, source_receipt in compacted.items():
+                expected_marker = {'mergedSourceSha256': index['mergedSource']['sha256'],
+                                   'indexSha256': index['index']['sha256'],
+                                   'originalReceiptSha256': index['sourceReceiptHashes'][state]}
+                if source_receipt['compactedInto'] != expected_marker:
+                    raise RuntimeError('Compacted source does not match canonical index')
+                original = {k: v for k, v in source_receipt.items() if k != 'compactedInto'}
+                original['files'] = {part['path']: {'bytes': part['bytes'], 'sha256': part['sha256']} for part in original['crop']['parts']}
+                original_bytes = (json.dumps(original, sort_keys=True, indent=2, allow_nan=False) + '\n').encode()
+                if hashlib.sha256(original_bytes).hexdigest() != expected_marker['originalReceiptSha256']:
+                    raise RuntimeError('Compacted source provenance differs from original receipt')
+        elif compacted:
+            raise RuntimeError('Compacted source has no compatible canonical index')
         if index.get('runtime') != plan['runtime']:
             raise RuntimeError('Canonical index runtime mismatch')
         if index.get('bounds') != config['bounds'] or index.get('zooms') != list(range(config['minzoom'], config['maxzoom'] + 1)):
@@ -691,6 +767,8 @@ def validate_checkpoint(config, plan, checkpoint):
         if len(set(all_tiles)) != len(all_tiles) or len(all_tiles) != index.get('candidateTileCount'):
             raise RuntimeError('Duplicate or missing canonical candidate tiles')
         result.update(indexReady=True, batchIds=ids, batchCount=len(ids))
+    if compacted and not result['indexReady']:
+        raise RuntimeError('Compacted source is missing its canonical index')
     batches_dir = checkpoint / 'batches'
     if batches_dir.exists():
         if batches_dir.is_symlink():
@@ -740,15 +818,16 @@ def assemble_region(config, plan, checkpoint, work, site, base):
                 path = staged / safe_relative(name)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(root / name, path)
-        merged = unpack_file(index['mergedSource'], checkpoint / 'index', staged / 'cycling-source.osm.pbf')
-        if merged.stat().st_size > MAX_FILE_BYTES:
-            raise RuntimeError('Public filtered source exceeds 24 MB file ceiling')
+        merged = unpack_file(index['mergedSource'], checkpoint / 'index', temp / 'cycling-source.osm.pbf')
+        source_package = write_source_package(merged, staged)
         sources = [verify_receipt(checkpoint / 'sources' / state, plan['planId'], 'source')['source'] for state in config['sourceStates']]
         stamp = now_utc().strftime('%Y%m%dT%H%M%SZ')
         provenance = {'sources': sources, 'sourcePlanId': plan['planId'], 'sourceDate': plan['sourceDate'],
                       'generatorCommit': os.environ.get('GITHUB_SHA', 'local'), 'generatorRunId': os.environ.get('GITHUB_RUN_ID'),
                       'bounds': config['bounds'], 'categories': legacy.KINDS, 'generatedAt': stamp,
-                      'sourceLicense': 'https://opendatacommons.org/licenses/odbl/1-0/', 'sourceExtractSha256': sha256(merged)}
+                      'sourceLicense': 'https://opendatacommons.org/licenses/odbl/1-0/', 'sourceExtractSha256': sha256(merged),
+                      'sourceExtractBytes': merged.stat().st_size, 'sourceFormat': SOURCE_FORMAT,
+                      'sourcePackageSha256': source_package['descriptorSha256']}
         write_json(staged / 'provenance.json', provenance)
         write_json(staged / 'tile-sha256.json', tile_hashes)
         report = {'generated_utc': now_utc().isoformat(), 'bounds': config['bounds'],
@@ -760,7 +839,8 @@ def assemble_region(config, plan, checkpoint, work, site, base):
         entry.update({'sourceLayer': 'cycleinfra', 'tiles': [prefix + '/tiles/{z}/{x}/{y}.pbf'], 'version': version,
                       'generatedAt': stamp, 'sourceUrl': prefix + '/provenance.json', 'sourceTimestamp': sources[0]['osmReplicationTimestamp'],
                       'categories': legacy.KINDS, 'tileCount': len(tile_hashes), 'tileBytes': tile_bytes,
-                      'sha256Manifest': prefix + '/tile-sha256.json', 'sourceDownload': prefix + '/cycling-source.osm.pbf'})
+                      'sha256Manifest': prefix + '/tile-sha256.json', 'sourceDownload': prefix + '/cycling-source.json',
+                      'sourceFormat': SOURCE_FORMAT, 'sourceArchiveSha256': source_package['descriptorSha256']})
         write_json(staged / 'tilejson.json', {'tilejson': '3.0.0', 'scheme': 'xyz', 'name': config['name'],
                    'bounds': config['bounds'], 'minzoom': config['minzoom'], 'maxzoom': config['maxzoom'],
                    'tiles': entry['tiles'], 'attribution': legacy.ATTRIBUTION,

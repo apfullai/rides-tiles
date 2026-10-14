@@ -275,17 +275,32 @@ class ResumableStagesTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'filesystem object'):
             r.verify_receipt(root)
 
-    def test_oversize_public_source_rejected_before_tile_work(self):
+    def test_public_source_above_file_cap_is_published_in_exact_chunks(self):
         self.make_sources()
+        source_size = 24_661_906  # The verified live Illinois crop size.
         def oversized_merge(*args):
             if args[1] == 'merge':
-                Path(args[args.index('-o') + 1]).write_bytes(b'x' * (r.MAX_FILE_BYTES + 1))
+                Path(args[args.index('-o') + 1]).write_bytes(b'x' * source_size)
             else:
                 fake_osmium(*args)
         with patch.object(r.legacy, 'run', side_effect=oversized_merge):
-            with self.assertRaisesRegex(RuntimeError, 'Public filtered source exceeds 24 MB'):
-                r.build_index_stage(CONFIG, self.source_plan, self.checkpoint, self.work)
-        self.assertFalse((self.checkpoint / 'index').exists())
+            index = r.build_index_stage(CONFIG, self.source_plan, self.checkpoint, self.work, batch_size=3)
+        self.assertEqual(index['mergedSource']['bytes'], source_size)
+        r.build_tile_group(self.checkpoint, self.work)
+        entry = r.assemble_region(CONFIG, self.source_plan, self.checkpoint, self.work, self.root / 'site', r.PUBLIC_BASE)
+        root = self.root / 'site/regions/fixture' / entry['version']
+        descriptor = r.validate_source_package(root, expected_sha256=entry['sourceArchiveSha256'])
+        self.assertEqual(entry['sourceFormat'], 'osm-pbf-chunks-v1')
+        self.assertTrue(entry['sourceDownload'].endswith('/cycling-source.json'))
+        self.assertEqual(descriptor['bytes'], source_size)
+        self.assertEqual(len(descriptor['chunks']), 4)
+        self.assertEqual(descriptor['sha256'], hashlib.sha256(b'x' * source_size).hexdigest())
+        self.assertFalse((root / 'cycling-source.osm.pbf').exists())
+        self.assertTrue(all(p.stat().st_size <= r.MAX_FILE_BYTES for p in root.rglob('*') if p.is_file()))
+        provenance = json.loads((root / 'provenance.json').read_text())
+        self.assertEqual(provenance['sourceExtractSha256'], descriptor['sha256'])
+        self.assertEqual(provenance['sourceExtractBytes'], source_size)
+        self.assertEqual(provenance['sourcePackageSha256'], entry['sourceArchiveSha256'])
 
     def test_runtime_change_blocks_every_resume_path(self):
         self.make_index()
@@ -357,6 +372,101 @@ class ResumableStagesTest(unittest.TestCase):
         self.assertFalse(status['indexReady'])
         r.build_index_stage(CONFIG, self.source_plan, self.checkpoint, self.work, batch_size=3)
         self.assertTrue(r.validate_checkpoint(CONFIG, self.source_plan, self.checkpoint)['indexReady'])
+
+    def test_source_groups_pause_resume_and_never_repeat_completed_state(self):
+        with patch.object(r.time, 'monotonic', side_effect=[0, 0, 0, 80, 80]):
+            first = r.build_source_group(CONFIG, self.source_plan, self.checkpoint, self.work, seconds=180, reserve_seconds=30)
+        self.assertEqual(first['completedStates'], ['new-york'])
+        self.assertEqual(first['remainingStates'], ['new-jersey'])
+        self.assertTrue(first['plannedPause'])
+        first_files = r.file_map(self.checkpoint / 'sources/new-york')
+        r.legacy.download_source.reset_mock()
+        rest = r.build_source_group(CONFIG, self.source_plan, self.checkpoint, self.work)
+        self.assertEqual(rest, {'completedStates': ['new-jersey'], 'remainingStates': [], 'plannedPause': False})
+        r.legacy.download_source.assert_called_once()
+        self.assertEqual(first_files, r.file_map(self.checkpoint / 'sources/new-york'))
+        self.assertEqual(r.build_source_group(CONFIG, self.source_plan, self.checkpoint, self.work)['completedStates'], [])
+
+    def test_source_group_too_little_time_does_not_download(self):
+        result = r.build_source_group(CONFIG, self.source_plan, self.checkpoint, self.work, seconds=30, reserve_seconds=20)
+        self.assertEqual(result, {'completedStates': [], 'remainingStates': CONFIG['sourceStates'], 'plannedPause': True})
+        r.legacy.download_source.assert_not_called()
+
+    def test_index_compacts_only_redundant_crops_and_preserves_provenance(self):
+        self.make_sources()
+        original = {state: (self.checkpoint / 'sources' / state / 'receipt.json').read_bytes() for state in CONFIG['sourceStates']}
+        index = r.build_index_stage(CONFIG, self.source_plan, self.checkpoint, self.work, batch_size=3)
+        self.assertTrue(index['compactedSourceCrops'])
+        for state in CONFIG['sourceStates']:
+            root = self.checkpoint / 'sources' / state
+            compacted = r.verify_receipt(root)
+            previous = json.loads(original[state])
+            self.assertEqual(compacted['source'], previous['source'])
+            self.assertEqual(compacted['crop'], previous['crop'])
+            self.assertEqual(compacted['files'], {})
+            self.assertEqual([path.name for path in root.iterdir()], ['receipt.json'])
+            self.assertEqual(index['sourceReceiptHashes'][state], hashlib.sha256(original[state]).hexdigest())
+        self.assertTrue(r.validate_checkpoint(CONFIG, self.source_plan, self.checkpoint)['indexReady'])
+        r.build_tile_group(self.checkpoint, self.work)
+        r.assemble_region(CONFIG, self.source_plan, self.checkpoint, self.work, self.root / 'site', r.PUBLIC_BASE)
+
+    def test_compacted_source_requires_valid_complete_index_and_original_metadata(self):
+        self.make_index()
+        root = self.checkpoint / 'sources/new-york'
+        receipt = json.loads((root / 'receipt.json').read_text())
+        receipt['source']['downloadedAt'] = '2026-10-02T00:00:00Z'
+        r.write_json(root / 'receipt.json', receipt)
+        with self.assertRaisesRegex(RuntimeError, 'original receipt'):
+            r.validate_checkpoint(CONFIG, self.source_plan, self.checkpoint)
+        receipt['source']['downloadedAt'] = CLOCK.isoformat()
+        r.write_json(root / 'receipt.json', receipt)
+        saved_index = self.root / 'saved-index'
+        (self.checkpoint / 'index').rename(saved_index)
+        with self.assertRaisesRegex(RuntimeError, 'missing its canonical index'):
+            r.validate_checkpoint(CONFIG, self.source_plan, self.checkpoint)
+        saved_index.rename(self.checkpoint / 'index')
+        receipt['compactedInto']['mergedSourceSha256'] = '0' * 64
+        r.write_json(root / 'receipt.json', receipt)
+        with self.assertRaisesRegex(RuntimeError, 'match canonical index'):
+            r.validate_checkpoint(CONFIG, self.source_plan, self.checkpoint)
+
+    def test_interrupted_compaction_cannot_mutate_previous_checkpoint(self):
+        self.make_sources()
+        previous = r.file_map(self.checkpoint)
+        candidate = self.root / 'candidate'
+        shutil.copytree(self.checkpoint, candidate)
+        original = r.compact_source_crops
+        def interrupt(config, plan, checkpoint, index):
+            original({**config, 'sourceStates': config['sourceStates'][:1]}, plan, checkpoint, index)
+            raise KeyboardInterrupt('simulated interruption after first compacted crop')
+        with patch.object(r, 'compact_source_crops', side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                r.build_index_stage(CONFIG, self.source_plan, candidate, self.work, batch_size=3)
+        self.assertEqual(previous, r.file_map(self.checkpoint))
+        self.assertFalse(r.validate_checkpoint(CONFIG, self.source_plan, self.checkpoint)['indexReady'])
+        with self.assertRaisesRegex(RuntimeError, 'Incomplete source compaction'):
+            r.validate_checkpoint(CONFIG, self.source_plan, candidate)
+        shutil.rmtree(candidate)
+        shutil.copytree(self.checkpoint, candidate)
+        r.build_index_stage(CONFIG, self.source_plan, candidate, self.work, batch_size=3)
+        self.assertTrue(r.validate_checkpoint(CONFIG, self.source_plan, candidate)['indexReady'])
+        self.assertEqual(previous, r.file_map(self.checkpoint))
+
+    def test_corrupt_packed_merge_does_not_remove_source_crops(self):
+        self.make_sources()
+        previous = r.file_map(self.checkpoint)
+        original = r.pack_file
+        def corrupt(source, root, name, compress=False):
+            descriptor = original(source, root, name, compress=compress)
+            if name == 'merged-source':
+                path = Path(root) / descriptor['parts'][0]['path']
+                path.write_bytes(b'bad data')
+            return descriptor
+        with patch.object(r, 'pack_file', side_effect=corrupt):
+            with self.assertRaisesRegex(RuntimeError, 'Corrupt checkpoint chunk'):
+                r.build_index_stage(CONFIG, self.source_plan, self.checkpoint, self.work, batch_size=3)
+        self.assertEqual(previous, r.file_map(self.checkpoint))
+        self.assertFalse((self.checkpoint / 'index').exists())
 
     def test_no_batch_fits_returns_planned_pause(self):
         index = self.make_index()

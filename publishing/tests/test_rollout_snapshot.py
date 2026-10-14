@@ -82,6 +82,54 @@ class DurableSnapshotTests(unittest.TestCase):
         result = snapshot.restore_published(destination, fetch=fetch_from(files), **kwargs)
         return destination, result
 
+    def chunk_source(self, source=b'public source extract'):
+        from source_package import write_source_package
+        manifest=json.loads((self.site/'manifest.json').read_text())
+        region=manifest['regions'][0];root=self.site/'regions'/region['id']/region['version']
+        original=root/'cycling-source.osm.pbf';original.write_bytes(source)
+        package=write_source_package(original,root);original.unlink()
+        region.update(sourceDownload=region['sourceDownload'].replace('cycling-source.osm.pbf','cycling-source.json'),
+                      sourceFormat='osm-pbf-chunks-v1',sourceArchiveSha256=package['descriptorSha256'])
+        provenance=json.loads((root/'provenance.json').read_text())
+        provenance.update(sourceExtractSha256=snapshot.digest(source),sourceExtractBytes=len(source),
+                          sourcePackageSha256=package['descriptorSha256'],sourceFormat='osm-pbf-chunks-v1')
+        dump(root/'provenance.json',provenance);dump(self.site/'manifest.json',manifest)
+        return root,package
+
+    def test_chunked_source_over_file_ceiling_round_trips_with_legacy_regions(self):
+        root,package=self.chunk_source(b'X'*(24_000_000+1))
+        manifest=json.loads((self.site/'manifest.json').read_text())
+        manifest['regions'].append(add_region(self.site,'legacy-region'))
+        dump(self.site/'manifest.json',manifest)
+        self.assertTrue(all(p.stat().st_size<=8_000_000 for p in (root/'cycling-source').iterdir()))
+        self.assertFalse((root/'cycling-source.osm.pbf').exists())
+        report,files=self.seal();restored,_=self.restore(files)
+        self.assertEqual(snapshot.inventory(restored),snapshot.inventory(self.site))
+        self.assertEqual(report['siteBytes'],sum(p.stat().st_size for p in self.site.rglob('*') if p.is_file()))
+        self.assertLess(report['siteBytes'],snapshot.MAX_SITE_BYTES)
+
+    def test_chunked_source_rejects_corruption_and_missing_parts(self):
+        root,package=self.chunk_source()
+        part=root/package['descriptor']['chunks'][0]['path'];original=part.read_bytes()
+        part.write_bytes(b'corrupt')
+        with self.assertRaises(ValueError):snapshot.validate_site(self.site)
+        part.write_bytes(original);part.unlink()
+        with self.assertRaises((ValueError,FileNotFoundError)):snapshot.validate_site(self.site)
+
+    def test_chunked_source_requires_both_descriptor_and_reconstructed_identity(self):
+        root,package=self.chunk_source()
+        for key,value in (('sourceExtractSha256','0'*64),('sourceExtractBytes',1),('sourcePackageSha256','0'*64)):
+            with self.subTest(key=key):
+                original=(root/'provenance.json').read_bytes()
+                provenance=json.loads(original);provenance[key]=value;dump(root/'provenance.json',provenance)
+                with self.assertRaises(ValueError):snapshot.validate_site(self.site)
+                (root/'provenance.json').write_bytes(original)
+
+    def test_unknown_source_format_is_not_treated_as_legacy(self):
+        manifest=json.loads((self.site/'manifest.json').read_text());manifest['regions'][0]['sourceFormat']='unknown'
+        dump(self.site/'manifest.json',manifest)
+        with self.assertRaisesRegex(ValueError,'Unsupported public source format'):snapshot.validate_site(self.site)
+
     def test_round_trip_preserves_every_file_and_rollout_state(self):
         manifest = json.loads((self.site / 'manifest.json').read_text())
         # An unknown region, its previous content version, and custom metadata

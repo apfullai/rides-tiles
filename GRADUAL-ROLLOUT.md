@@ -14,8 +14,8 @@ The existing admission ceiling remains 100 elapsed publishing runner-minutes per
 
 The active descriptor and compact stage files live under `checkpoints/active/`, separate from the map's active `manifest.json`. Each completed coarse stage becomes durable only after a successful Pages deployment:
 
-1. Discover a common dated source release and complete one state's filtered/cropped source.
-2. Acquire each remaining state in a subsequent stage, reusing verified completed crops.
+1. Discover a common dated source release and acquire a bounded group of filtered/cropped states.
+2. Continue remaining pinned states in bounded groups, reusing verified completed crops.
 3. Merge the sources and create a canonical global feature/tile index.
 4. Encode a time-bounded group of disjoint tile batches using the same global feature IDs, ordering, clipping and properties as uninterrupted generation.
 5. Validate the complete region, derive its immutable content version and atomically promote the manifest entry.
@@ -58,3 +58,44 @@ Tests cover interrupted/resumed raw tile equality, missing/duplicate batches, so
     python -m unittest discover -s publishing/tests -v
 
 References: [Geofabrik retention and extracts](https://download.geofabrik.de/technical.html), [Osmium same-time merge requirement](https://docs.osmcode.org/osmium/latest/osmium-merge.html), [Actions public-runner billing](https://docs.github.com/en/billing/managing-billing-for-your-products/managing-billing-for-github-actions/about-billing-for-github-actions), [Pages limits](https://docs.github.com/en/pages/getting-started-with-github-pages/github-pages-limits), [public workflow API](https://docs.github.com/en/rest/actions/workflow-runs), [artifact API](https://docs.github.com/en/rest/actions/artifacts).
+
+## Chunked public source extracts and the first checkpoint migration
+
+New completed regions expose `sourceFormat: "osm-pbf-chunks-v1"`.
+`sourceDownload` points to the version's `cycling-source.json`, with the ordered
+chunk paths, byte counts, per-chunk SHA-256, and full reconstructed PBF SHA-256.
+Download those relative paths, concatenate them in listed order into
+`cycling-source.osm.pbf`, and verify its declared byte count and SHA-256.
+Each chunk is at most 8,000,000 bytes. The region's `sourceArchiveSha256` and
+provenance `sourcePackageSha256` identify the descriptor; provenance
+`sourceExtractSha256` identifies the reconstructed PBF. Existing single-file
+source extracts and frozen archives retain their original URLs and bytes.
+The app's tile URLs and manifest schema version do not change.
+
+An admitted source stage may acquire a contiguous group of remaining pinned
+states while its cooperative clock permits. The process watchdog and save
+reserve still apply. A successful index stage verifies its packed merged PBF
+and feature index, then removes redundant raw state-crop chunks only from the
+disposable candidate. Compacted source receipts retain original source/crop
+metadata and exact original receipt hashes, linked to the verified merged PBF
+and index. The previously published checkpoint remains intact until the new
+snapshot is deployed. Failure or interruption never changes that live snapshot.
+
+One compatibility migration is explicitly allowlisted: the exact Illinois-only
+checkpoint published by run `38619620372` from code `57493447e97a2957c11be6d1cf4d2241841d59c7`.
+Its descriptor SHA-256 is
+`48e41324d47dd639b268fa1cb36af97681a219e79a20b9f4ad3a8c7b434e82e3`.
+The migration verifies its outer inventory, source receipt and streamed whole
+crop identity, unchanged source acquisition/pinning/runtime/hash semantics and
+dependencies, then requires successful current-code verification. Only the code
+fingerprint and an explicit migration audit record change; generation, source
+plan, runtime, progress, and existing crop bytes are preserved. Subsequent
+ordinary stages advance that generation. Other code/config/runtime mismatches
+remain blocked rather than silently reset or repinned.
+
+Chunking removes a single-file limit; it does not increase the 250 MB site or
+repository-artifact ceilings. A still-live one-day artifact can postpone the
+next checkpoint, and the pinned daily sources can expire before all states are
+acquired. These conditions still fail closed without deletion or a budget
+increase. Successful metadata discovery does not guarantee a complete city will
+fit the remaining storage or runtime allowance.

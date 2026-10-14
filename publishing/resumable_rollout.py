@@ -77,8 +77,13 @@ def validate_transition(config, before, after, stage):
     kind = stage['kind']
     if kind in ('start', 'source'):
         state = config['sourceStates'][0] if kind == 'start' else stage['state']
-        expected = [s for s in config['sourceStates'] if s in set(before['completedStates']) | {state}]
-        if after != {**before, 'completedStates': expected} or state in before['completedStates']:
+        completed = after['completedStates']
+        pending = [s for s in config['sourceStates'] if s not in before['completedStates']]
+        added = [s for s in completed if s not in before['completedStates']]
+        expected = before['completedStates'] + added
+        if (before['completedStates'] != config['sourceStates'][:len(before['completedStates'])]
+                or after != {**before, 'completedStates': expected}
+                or added != pending[:len(added)] or not pending or pending[0] != state):
             raise ValueError('Source stage advanced unexpected work')
     elif kind == 'index':
         if before['indexReady'] or not after['indexReady'] or after['completedStates'] != before['completedStates'] or after['completedBatches']:
@@ -214,7 +219,8 @@ def status_for(checkpoint, now, *, last_completed=None, mode=None):
             'sourceAcquisitionExpiresAt': (checkpoint.get('sourcePlan') or {}).get('expiresAt') if checkpoint else None,
             'failureCount': checkpoint.get('failureCount', 0) if checkpoint else 0,
             'generationId': checkpoint['generationId'] if checkpoint else None,
-            'verification': mode, 'lastCompleted': last_completed}
+            'verification': mode, 'lastCompleted': last_completed,
+            'checkpointMigration': checkpoint.get('migration') if checkpoint else None}
 
 
 def write_status(site, status):
@@ -290,9 +296,14 @@ def advance(site, configs, *, allow_new=False, start_region=None, now=None, dead
         timestamp = checkpoint['sourcePlan'].get('osmReplicationTimestamp')
         if old and old.get('sourceTimestamp') and (not timestamp or utc(timestamp) < utc(old['sourceTimestamp'])):
             return blocked_publication(site, ValueError('Pinned source would regress active source freshness'), now, deadline, verifier, monotonic)
-    if checkpoint and checkpoint.get('codeFingerprint') != fingerprinter(ROOT):
-        return blocked_publication(site, ValueError('Active checkpoint code changed; explicit restart required'),
-                                   now, deadline, verifier, monotonic)
+    current_fingerprint = fingerprinter(ROOT)
+    migration_pending = False
+    if checkpoint and checkpoint.get('codeFingerprint') != current_fingerprint:
+        from checkpoint_migrations import eligible
+        migration_pending = eligible(site/ACTIVE, checkpoint, ROOT)
+        if not migration_pending:
+            return blocked_publication(site, ValueError('Active checkpoint code changed; explicit restart required'),
+                                       now, deadline, verifier, monotonic)
     if start_region and (checkpoint or not allow_new):
         raise ValueError('Explicit start requires new-work permission and no active generation')
     if checkpoint is None:
@@ -312,7 +323,11 @@ def advance(site, configs, *, allow_new=False, start_region=None, now=None, dead
     code_hash = receipt.get('fingerprint')
     if not isinstance(code_hash, str) or not re.fullmatch(r'[0-9a-f]{64}', code_hash):
         raise ValueError('Verification did not establish a source fingerprint')
-    if checkpoint:
+    if migration_pending:
+        from checkpoint_migrations import migrate
+        checkpoint = migrate(site/ACTIVE, checkpoint, ROOT, target_fingerprint=current_fingerprint,
+                             verified_fingerprint=code_hash, now=now)
+    elif checkpoint:
         checkpoint = load_checkpoint(site, configs, expected_fingerprint=code_hash, inspector=inspector)
     else:
         config, purpose = selected
@@ -321,6 +336,12 @@ def advance(site, configs, *, allow_new=False, start_region=None, now=None, dead
             'purpose': purpose, 'sourcePlan': None, 'progress': empty_progress(config), 'nextStage': {'kind': 'start'},
             'startedAt': now.isoformat(), 'updatedAt': now.isoformat(), 'retryAfter': None, 'lastError': None, 'stageCount': 0, 'failureCount': 0, 'needsAttention': False, 'files': {}}
     checkpoint = copy.deepcopy(checkpoint)
+    if migration_pending:
+        # Keep a small durable audit record after this generation is promoted.
+        audits = state.setdefault('checkpointMigrations', [])
+        if not isinstance(audits, list):
+            raise ValueError('Invalid checkpoint migration audit history')
+        audits.append({'generationId': checkpoint['generationId'], **checkpoint['migration']})
     stage = checkpoint['nextStage']
     result = None
     last_completed = None
@@ -347,11 +368,27 @@ def advance(site, configs, *, allow_new=False, start_region=None, now=None, dead
                 if result.get('progress') != progress:
                     raise ValueError('Stage completion differs from verified progress')
                 validate_transition(checkpoint['config'], checkpoint['progress'], progress, stage)
+                if stage['kind'] not in ('index', 'finalize'):
+                    current_files = checkpoint_files(candidate/ACTIVE)
+                    if any(current_files.get(path) != record for path,record in checkpoint['files'].items()
+                           if path.startswith(('sources/', 'index/', 'batches/'))):
+                        raise ValueError('Stage changed a previously completed checkpoint file')
                 old_next = stage
                 following = next_stage(checkpoint['config'], progress, plan)
                 if stage['kind'] not in ('start', 'finalize') and following == old_next:
-                    if stage['kind'] != 'tiles' or result.get('plannedPause') is not True:
+                    if stage['kind'] not in ('tiles', 'source') or result.get('plannedPause') is not True:
                         raise ValueError('Successful stage did not advance progress')
+                if (stage['kind'] in ('start', 'source')
+                        and len(progress['completedStates'])-len(checkpoint['progress']['completedStates']) > 1
+                        and 'sourceGroup' not in result):
+                    raise ValueError('Multiple source advances require an explicit group receipt')
+                if stage['kind'] in ('start', 'source') and 'sourceGroup' in result:
+                    added = [s for s in progress['completedStates'] if s not in checkpoint['progress']['completedStates']]
+                    remaining = [s for s in checkpoint['config']['sourceStates'] if s not in progress['completedStates']]
+                    group = result['sourceGroup']
+                    if (group.get('completedStates') != added or group.get('remainingStates') != remaining
+                            or group.get('plannedPause', bool(remaining)) != bool(remaining)):
+                        raise ValueError('Source group receipt disagrees with verified source stages')
                 if stage['kind'] == 'tiles' and 'group' in result:
                     added = [b for b in progress['completedBatches'] if b not in checkpoint['progress']['completedBatches']]
                     remaining = [b for b in progress['batchIds'] if b not in progress['completedBatches']]
@@ -405,6 +442,8 @@ def advance(site, configs, *, allow_new=False, start_region=None, now=None, dead
                     failureCount=failures, needsAttention=attention,
                     lastError={'at': now.isoformat(), 'message': detail.get('message', str(error))[:500]})
                 print(json.dumps({'phase': 'checkpoint-retained', 'reason': str(error)[:500]}), flush=True)
+        if migration_pending:
+            write_json(candidate/'rollout-state.json', state)
         if checkpoint is not None:
             save_checkpoint(candidate, checkpoint)
             load_checkpoint(candidate, configs, expected_fingerprint=code_hash, inspector=inspector)

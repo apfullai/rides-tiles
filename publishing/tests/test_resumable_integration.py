@@ -92,10 +92,12 @@ class ResumableIntegrationTests(unittest.TestCase):
                     shutil.rmtree(site);restored.rename(site)
                     if not report['active']:break
                 else:self.fail('Build failed to reach promotion')
-                self.assertEqual(number,4)
+                self.assertEqual(number,3)
                 active=json.loads((site/'manifest.json').read_text())['regions'][0]
                 self.assertNotEqual(active['version'],old['version'])
                 self.assertEqual(active['sourceTimestamp'],'2026-10-01T20:21:31Z')
+                self.assertEqual(active['sourceFormat'],'osm-pbf-chunks-v1')
+                self.assertTrue(active['sourceDownload'].endswith('/cycling-source.json'))
                 self.assertFalse((site/rollout.ACTIVE).exists())
                 self.assertTrue(all(snapshot.inventory(site/'regions')[k]==v for k,v in prior.items()))
                 snapshot.validate_site(site)

@@ -4,6 +4,7 @@ import datetime as dt
 import json
 from pathlib import Path
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'tools'))
@@ -30,6 +31,7 @@ def run(request, checkpoint, work, result_path):
     checkpoint.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
     result = {'schemaVersion': 1, 'stage': stage}
+    started = time.monotonic()
     if kind in ('start', 'plan'):
         plan = stages.plan_sources(config, now=dt.datetime.now(dt.timezone.utc))
         result['sourcePlan'] = plan
@@ -47,7 +49,10 @@ def run(request, checkpoint, work, result_path):
         kind = 'source'
         result['stage'] = stage
     if kind == 'source':
-        result['receipt'] = receipt_summary(stages.build_source_stage(config, plan, stage['state'], work, checkpoint))
+        seconds = max(1, min(240, request.get('stageSeconds', 300)-15-(time.monotonic()-started)))
+        result['sourceGroup'] = stages.build_source_group(config, plan, checkpoint, work,
+            seconds=seconds, reserve_seconds=min(30, seconds/3))
+        result['plannedPause'] = not result['sourceGroup']['completedStates']
     elif kind == 'index':
         result['receipt'] = receipt_summary(stages.build_index_stage(config, plan, checkpoint, work, batch_size=request.get('batchSize', 128)))
     elif kind == 'tiles':

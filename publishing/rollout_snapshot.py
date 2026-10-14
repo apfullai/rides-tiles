@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import sys
 import tarfile
 import tempfile
 from urllib.error import HTTPError
@@ -24,6 +25,9 @@ from urllib.request import Request, urlopen
 
 import append_metro
 import restore_snapshot
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
+from source_package import validate_source_package
 
 BASE = append_metro.BASE
 MAX_SITE_BYTES = 250_000_000
@@ -226,9 +230,24 @@ def _validate_data(site, base_url=BASE):
         provenance_hash = provenance.get('sourceExtractSha256')
         if provenance.get('kind') != 'exact-native-tile-subset':
             provenance_hash = provenance_hash or provenance.get('archiveSha256')
-        expected_hashes = [h for h in (own_hash, provenance_hash) if h is not None]
-        if not expected_hashes or any(_hash(h) != files[source_name]['sha256'] for h in expected_hashes):
-            raise ValueError('Source archive hash differs or is absent')
+        if region.get('sourceFormat') == 'osm-pbf-chunks-v1':
+            if source_url != prefix + 'cycling-source.json' or provenance.get('sourceFormat') != region['sourceFormat']:
+                raise ValueError('Invalid chunked source format or descriptor URL')
+            descriptor_hash = files[source_name]['sha256']
+            if (_hash(own_hash) != descriptor_hash
+                    or _hash(provenance.get('sourcePackageSha256')) != descriptor_hash):
+                raise ValueError('Source package descriptor hash differs or is absent')
+            package = validate_source_package(root, expected_sha256=descriptor_hash)
+            if (_hash(provenance_hash) != package['sha256']
+                    or type(provenance.get('sourceExtractBytes')) is not int
+                    or provenance['sourceExtractBytes'] != package['bytes']):
+                raise ValueError('Source package reconstructed identity differs')
+        else:
+            if region.get('sourceFormat') is not None:
+                raise ValueError('Unsupported public source format')
+            expected_hashes = [h for h in (own_hash, provenance_hash) if h is not None]
+            if not expected_hashes or any(_hash(h) != files[source_name]['sha256'] for h in expected_hashes):
+                raise ValueError('Source archive hash differs or is absent')
         metadata = provenance.get('sourceMetadata', {})
         if not isinstance(metadata, dict):
             raise ValueError('Invalid upstream source metadata')
