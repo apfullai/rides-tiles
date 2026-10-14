@@ -1,6 +1,7 @@
 {
-  "requestId": "initial-budgeted-rollout-2026-10-14",
-  "verifiedCommit": "953529958cbd49415413d423635c892bc02af40e",
-  "verificationRun": 38608031874,
-  "purpose": "Initial bounded refresh and at most one queued city, subject to all runtime and storage guards"
+  "requestId": "chicago-resumable-checkpoint-2026-10-14",
+  "verifiedCommit": "57493447e97a2957c11be6d1cf4d2241841d59c7",
+  "verificationRun": 38618998897,
+  "startRegion": "chicagoland",
+  "purpose": "Advance one durable Chicago checkpoint after independent CI verification, subject to unchanged runtime and storage caps"
 }
