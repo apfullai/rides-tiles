@@ -1,8 +1,6 @@
 name: Refresh coverage and gradually add US cities
 on:
-  schedule:
-    - cron: '23 9 * * 1'
-    - cron: '23 9 * * 0,2-6'
+  # Paused during migration to apfullai/ride-tiles; preserve this recovery origin.
   workflow_dispatch:
     inputs:
       start_region:
@@ -20,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   budget:
-    if: github.ref == 'refs/heads/main'
+    if: ${{ false }} # Old publisher paused; the successor owns continuation.
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     outputs:
